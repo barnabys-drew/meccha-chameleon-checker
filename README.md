@@ -254,6 +254,10 @@ changed by the attacker. The `--deep` checks target behaviour instead:
 The test suite asserts this gap explicitly: a fixture representing a repackaged variant is **missed
 by the IOC checks and caught by `--deep`**.
 
+**Full technical write-up:** [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) — how every check works,
+the design constraints that must not be reversed, and an honest list of **what the tool can't do
+yet and where help is wanted**.
+
 **How indicators get updated:** see [docs/IOC-PROCESS.md](docs/IOC-PROCESS.md). Short version — a
 scheduled agent researches new maps and techniques, everything passes
 `tools/validate-indicators.sh`, and each finding arrives as a pull request citing its source. **No
@@ -264,6 +268,22 @@ indicator reaches `main` without a human approving it.**
 only one confirmed ID.
 
 </details>
+
+---
+
+---
+
+<div align="center">
+
+## 🛠️ Are you a developer or security researcher?
+
+**[Read how it works, and what it can't do yet →](docs/HOW-IT-WORKS.md)**
+
+There is an honest list of gaps in there. The biggest one:
+the malware's second stage was **never captured by anyone**,
+so nothing — this tool included — can detect what it left behind.
+
+</div>
 
 ---
 

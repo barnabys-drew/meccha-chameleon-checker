@@ -1,0 +1,21 @@
+{
+  "campaign": "Meccha Chameleon Steam Workshop dropper",
+  "updated": "2026-07-26",
+  "source": "https://medium.com/@FeintBE/workshop-map-for-meccha-chameleon-is-a-malware-dropper-full-breakdown-d1ac29565265",
+  "steam_appid": "4704690",
+  "malicious_workshop_ids": [
+    { "id": "3765145606", "name": "Laser Tag Neon", "status": "removed from Workshop" }
+  ],
+  "unconfirmed_id_map_names": ["Chroma Grid Arena"],
+  "file_hashes_sha256": {
+    "1ff540bc3c493a93059e602b414ba61027ed1a2b8a079f6197b0718f4a2101b6": "s.bat dropper (210 bytes)",
+    "aa58f9061a4e39e3f5a28395c56cfa5b0072d90e66054894f9c8022e81e396c9": "malicious .pak",
+    "aea429fbb44d552c917c22018e838e4154e68a8cac5806f7a8e30b61586ba2a6": "malicious .utoc",
+    "fbd932faba4ec8d614fbd7a68636e177213259bafe2babdcdc47c2a8acd6d569": "malicious .ucas"
+  },
+  "c2_ip": "31.57.34.228",
+  "c2_url": "http://31.57.34.228/work/steamb.bat",
+  "content_strings": ["31.57.34.228", "steamb.bat", "set _Z=1", "BP_RCE_Test_C_0"],
+  "dropped_filenames": ["s.bat"],
+  "blueprint_asset": "BP_AmbientController.uasset"
+}

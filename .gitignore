@@ -1,0 +1,9 @@
+# Scan reports produced by the tool on a user's machine
+meccha-check-report-*.txt
+
+# Test fixtures are generated at runtime, never committed.
+# A committed .bat containing the real payload string would be flagged by AV
+# scanners and by GitHub.
+tests/fixtures/
+
+*.tmp

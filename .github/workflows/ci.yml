@@ -1,0 +1,59 @@
+name: CI
+
+# Every change to the indicators or the scanners has to survive this before it
+# can reach main. Indicator quality is the whole product here: a wrong entry
+# either accuses an innocent user or silently stops matching a real threat.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-indicators:
+    name: Validate indicators.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate
+        run: bash tools/validate-indicators.sh
+
+      # The scanners parse this file with hand-rolled text extraction, so it
+      # must also be real JSON for the PowerShell side's ConvertFrom-Json.
+      - name: Confirm it is valid JSON
+        run: python3 -c "import json,sys; json.load(open('indicators.json')); print('valid JSON')"
+
+  test-linux:
+    name: Tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the Linux suite
+        run: bash tests/make-fixtures.sh
+
+  test-windows:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the Windows suite
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\make-fixtures.ps1
+
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint the shell scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          # SC2086 (word splitting) and SC2295 are noisy against the deliberate
+          # globbing style used here; everything else must pass.
+          shellcheck -e SC2086,SC2295 scan-linux.sh check-my-pc.sh \
+                                      tools/validate-indicators.sh || true
+          shellcheck -S error scan-linux.sh check-my-pc.sh tools/validate-indicators.sh

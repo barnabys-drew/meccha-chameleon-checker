@@ -14,7 +14,8 @@
 param(
     [string]$ScanRoot,
     [string]$Indicators,
-    [switch]$NoColor
+    [switch]$NoColor,
+    [switch]$Deep
 )
 
 $ErrorActionPreference = 'Continue'
@@ -26,6 +27,7 @@ if (-not $Indicators) { $Indicators = Join-Path $ScriptDir 'indicators.json' }
 $script:ReportLines  = New-Object System.Collections.Generic.List[string]
 $script:FoundCount   = 0
 $script:SuspectCount = 0
+$script:NoteCount    = 0
 
 function Say {
     param([string]$Text, [string]$Color)
@@ -44,6 +46,17 @@ function Add-Finding {
         Say "  [SUSPICIOUS] $What" 'Yellow'
     }
     Say "               $Where" 'DarkGray'
+}
+
+# A third tier, used only by -Deep. These are behaviour patterns, not known
+# indicators: they describe something that LOOKS like how this malware works,
+# which an innocent file can also do. Kept separate from the Found/Suspect
+# counts so behaviour alone never reads as "you are infected".
+function Add-Note {
+    param([string]$What, [string]$Where)
+    $script:NoteCount++
+    Say "  [WORTH A LOOK] $What" 'Cyan'
+    Say "                 $Where" 'DarkGray'
 }
 
 # ------------------------------------------------------------ indicator load
@@ -360,6 +373,130 @@ foreach ($sd in $startupDirs) {
 Say '  Checked startup entries, the Startup folder and scheduled tasks.' 'DarkGray'
 Say ''
 
+# -------------------------------------------------- -Deep: behaviour checks
+#
+# Everything above matches indicators researchers have published. Those are
+# exact, but they are also the easiest thing in the world for the attacker to
+# change -- a recompiled map with a new server address defeats all of it.
+#
+# The checks below describe how this malware BEHAVES instead, so they can catch
+# a repackaged copy nobody has catalogued. The trade-off is that innocent files
+# can behave the same way, which is why they report as "worth a look" and never
+# as a confirmed finding.
+
+if ($Deep) {
+    Say '  Deep scan: looking for suspicious behaviour...' 'White'
+
+    $hidePat  = '-w\s+hidden|-windowstyle\s+hidden|-ep\s+bypass|-executionpolicy\s+bypass|-nop\b|-noprofile|-enc\b|-encodedcommand'
+    $fetchPat = '\biwr\b|invoke-webrequest|downloadstring|downloadfile|certutil|bitsadmin|\bcurl\b|\bwget\b'
+    $execPat  = '%temp%|\$env:temp|start\s+/min|cmd\s+/c|&\s*exit'
+
+    # -- B1 and B2: batch files where they do not belong, and what they do ---
+    # Documents is a place for documents. A .bat or .cmd sitting there is not
+    # where anything legitimate normally puts one, and it is exactly where this
+    # malware writes its dropper -- no known indicator required to spot it.
+    #
+    # B2 is a combination rather than one string: hide a window, fetch
+    # something, run it from a temp folder. Any one alone is common in
+    # legitimate scripts; together they describe this malware family whichever
+    # server it happens to call.
+    foreach ($d in $dropDirs) {
+        $scripts = Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Extension -match '^\.(bat|cmd|ps1)$' }
+        foreach ($s in $scripts) {
+            if ($s.Extension -match '^\.(bat|cmd)$') {
+                Add-Note 'A batch file is sitting in a documents folder, which is unusual' $s.FullName
+            }
+            $body = ''
+            try { $body = (Get-Content -LiteralPath $s.FullName -Raw -ErrorAction Stop).ToLower() } catch { continue }
+            $cats = @()
+            if ($body -match $hidePat)  { $cats += 'hidden window' }
+            if ($body -match $fetchPat) { $cats += 'downloads from the internet' }
+            if ($body -match $execPat)  { $cats += 'runs from a temp folder' }
+            if ($cats.Count -ge 2) {
+                Add-Note "A script here behaves like this malware ($($cats -join ', '))" $s.FullName
+            }
+        }
+    }
+
+    # -- B3: Unreal capability abuse inside Workshop maps -------------------
+    # A community map is scenery. It has no legitimate reason to reach for the
+    # user's home directory or launch a process. Spotting the CAPABILITY rather
+    # than the payload is what catches a malicious map nobody has reported yet.
+    $capMarkers = @('GetPlatformUserDir','SaveStringToFile','SaveStringArrayToFile',
+                    'ExecuteConsoleCommand','LaunchURL','CreateProc','BP_RCE')
+    foreach ($root in $SteamRoots) {
+        $content = Join-Path $root "steamapps\workshop\content\$AppId"
+        if (-not (Test-Path -LiteralPath $content)) { continue }
+        $paks = Get-ChildItem -LiteralPath $content -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -match '^\.(pak|utoc|ucas)$' }
+        foreach ($pak in $paks) {
+            $hit = Test-ContainsMarker -Path $pak.FullName -Markers $capMarkers
+            if ($hit) {
+                Add-Note "A map can write files or launch programs, which maps do not need (`"$hit`")" $pak.FullName
+            }
+        }
+    }
+
+    # -- B4: evidence that something already ran ----------------------------
+    # The only checks that can still find anything after the files themselves
+    # have been deleted.
+    if (-not $Synthetic) {
+        # Prefetch records which files a program touched. Paths are stored in
+        # UTF-16 and upper-cased, so the markers are upper-cased to match.
+        $pfDir = Join-Path $env:SystemRoot 'Prefetch'
+        $upper = @($DropNames | ForEach-Object { $_.ToUpper() }) + @('STEAMB.BAT')
+        if (Test-Path -LiteralPath $pfDir) {
+            $pfFiles = $null
+            try {
+                $pfFiles = Get-ChildItem -LiteralPath $pfDir -Filter '*.pf' -ErrorAction Stop |
+                           Where-Object { $_.Name -match '^(CMD|POWERSHELL)\.EXE' }
+            } catch {
+                Say '  (Prefetch needs Administrator to read -- skipped)' 'DarkGray'
+            }
+            foreach ($pf in @($pfFiles)) {
+                $hit = Test-ContainsMarker -Path $pf.FullName -Markers $upper
+                if ($hit) {
+                    Add-Note "Windows recorded a command window opening the malware's file (`"$hit`")" $pf.FullName
+                }
+            }
+        }
+
+        # Defender may already have caught and quarantined it.
+        try {
+            $dets = Get-MpThreatDetection -ErrorAction Stop
+            foreach ($det in @($dets)) {
+                $res = ($det.Resources -join ' ')
+                foreach ($n in @($DropNames) + @('steamb.bat')) {
+                    if ($res -like "*$n*") {
+                        Add-Note 'Microsoft Defender previously detected something matching this malware' $res
+                        break
+                    }
+                }
+            }
+        } catch { }
+
+        # PowerShell script-block logging, if it happens to be enabled.
+        try {
+            $evts = Get-WinEvent -FilterHashtable @{
+                        LogName = 'Microsoft-Windows-PowerShell/Operational'; Id = 4104
+                    } -MaxEvents 300 -ErrorAction Stop
+            foreach ($e in $evts) {
+                foreach ($n in $BadStrings) {
+                    if ($e.Message -like "*$n*") {
+                        Add-Note "A PowerShell log entry contains a known malware marker (`"$n`")" `
+                                 "Event 4104 at $($e.TimeCreated)"
+                        break
+                    }
+                }
+            }
+        } catch { }
+    }
+
+    if ($script:NoteCount -eq 0) { Say '  Nothing behaving suspiciously.' 'Green' }
+    Say ''
+}
+
 # ------------------------------------------------------------------- verdict
 
 Say '  --------------------------------------------------------------' 'DarkGray'
@@ -388,6 +525,23 @@ if ($script:FoundCount -gt 0 -or $script:SuspectCount -gt 0) {
     Say '   6. Unsubscribe from the map in the Steam Workshop, and make sure'
     Say '      Meccha Chameleon is updated to version 3.2.0 or later.'
     Say ''
+} elseif ($script:NoteCount -gt 0) {
+    $exitCode = 3
+    Say "  No known malware was found, but $($script:NoteCount) thing(s) are worth a look." 'Cyan'
+    Say ''
+    Say '  Do not panic. Nothing above matches this malware. The deep scan'
+    Say '  flags anything that merely BEHAVES a bit like it, and ordinary files'
+    Say '  can do that too -- a game launcher script, a modding tool, a backup'
+    Say '  job. Most of the time this is a false alarm.'
+    Say ''
+    Say '  This tool has changed nothing. Nothing was deleted or moved.'
+    Say ''
+    Say '  If you want to be sure, run a full scan with Microsoft Defender or'
+    Say '  Malwarebytes, and open the files listed above in Notepad to see what'
+    Say '  they do. If a file downloads something from an address you do not'
+    Say '  recognise and hides its window while doing it, treat it the way you'
+    Say '  would a confirmed finding above.'
+    Say ''
 } else {
     Say '  No known indicators of this malware were found.' 'Green'
     Say ''
@@ -403,6 +557,12 @@ if ($script:FoundCount -gt 0 -or $script:SuspectCount -gt 0) {
     Say '  treat this result with suspicion: run a full antivirus scan and change'
     Say '  your passwords from a different device anyway.'
     Say ''
+    if (-not $Deep) {
+        Say '  Tip: this checked for the exact malware researchers have published.' 'DarkGray'
+        Say '  To also look for files merely BEHAVING like it -- which can catch a' 'DarkGray'
+        Say '  repackaged copy -- double-click check-my-pc-deep.bat instead.' 'DarkGray'
+        Say ''
+    }
 }
 
 # --------------------------------------------------------------- report file

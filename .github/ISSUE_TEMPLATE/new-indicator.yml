@@ -1,0 +1,74 @@
+name: Report a malicious map or new indicator
+description: Tell us about a Meccha Chameleon Workshop map that looks malicious, so the checker can detect it.
+title: "[IOC] "
+labels: ["indicator", "needs-verification"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping. A few things worth knowing before you fill this in:
+
+        **Every indicator needs a source.** This tool tells ordinary players whether their
+        PC is infected. A wrong entry accuses someone who did nothing wrong, so nothing goes
+        in without evidence — a link, a hash you computed yourself, or your own analysis.
+
+        **Do not attach malware samples.** Hashes, IDs and strings only. Never upload the
+        actual `.pak` or `.bat` file to this repo.
+
+        **If you think you are infected**, this is the wrong form — run the checker and
+        follow the steps it prints.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of indicator is this?
+      options:
+        - A malicious Workshop map ID
+        - A file hash (SHA256)
+        - A server address the malware contacts
+        - A string found inside a malicious file
+        - A behaviour or technique the checker should look for
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: indicator
+    attributes:
+      label: The indicator itself
+      description: Workshop ID, SHA256 hash, IP/domain, or the exact string. One per line.
+      placeholder: |
+        Workshop ID: 3765145606
+        SHA256: 1ff540bc3c493a93059e602b414ba61027ed1a2b8a079f6197b0718f4a2101b6
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: map-name
+    attributes:
+      label: Map name, if you know it
+      placeholder: Laser Tag Neon
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How do you know?
+      description: >
+        A link to an analysis, a sandbox report, a VirusTotal link, or your own findings.
+        If you analysed it yourself, say what you saw and how.
+      placeholder: |
+        Link to writeup, or: I extracted the .pak and found a Blueprint that writes to
+        the Documents folder on BeginPlay. Here is what it does...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Please confirm
+      options:
+        - label: I have not attached an actual malware sample to this issue.
+          required: true
+        - label: I understand this will be verified before it is added.
+          required: true

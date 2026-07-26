@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INDICATORS="$SCRIPT_DIR/indicators.json"
 SCAN_ROOT=""
 USE_COLOR=1
+DEEP=0
 REPORT_LINES=()
 
 # ---------------------------------------------------------------- arguments
@@ -23,6 +24,11 @@ usage() {
     cat <<'EOF'
 Usage: ./scan-linux.sh [options]
 
+  --deep             Also look for suspicious BEHAVIOUR, not just the exact
+                     known indicators. Catches repackaged copies the
+                     researchers have not catalogued yet, but can point at
+                     innocent files. Anything it finds is worth a look, not
+                     proof of infection.
   --scan-root DIR    Scan DIR as a synthetic root instead of the real system
                      (used by the test fixtures)
   --indicators FILE  Use an alternative indicators file
@@ -35,6 +41,7 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --deep)        DEEP=1; shift ;;
         --scan-root)   SCAN_ROOT="${2:-}"; shift 2 ;;
         --indicators)  INDICATORS="${2:-}"; shift 2 ;;
         --no-color)    USE_COLOR=0; shift ;;
@@ -46,9 +53,10 @@ done
 if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ]; then USE_COLOR=0; fi
 if [ "$USE_COLOR" = 1 ]; then
     C_RED=$'\033[1;31m'; C_YEL=$'\033[1;33m'; C_GRN=$'\033[1;32m'
+    C_CYA=$'\033[1;36m'
     C_DIM=$'\033[2m';    C_BLD=$'\033[1m';    C_OFF=$'\033[0m'
 else
-    C_RED=""; C_YEL=""; C_GRN=""; C_DIM=""; C_BLD=""; C_OFF=""
+    C_RED=""; C_YEL=""; C_GRN=""; C_CYA=""; C_DIM=""; C_BLD=""; C_OFF=""
 fi
 
 # Print to the screen and capture for the report file.
@@ -119,6 +127,17 @@ fi
 
 FOUND_COUNT=0
 SUSPECT_COUNT=0
+NOTE_COUNT=0
+
+# A third tier, used only by --deep. These are behaviour patterns, not known
+# indicators: they describe something that LOOKS like how this malware works,
+# which an innocent file can also do. Kept separate from FOUND/SUSPICIOUS
+# counts so behaviour alone never reads as "you are infected".
+note() {  # note <what> <where>
+    NOTE_COUNT=$((NOTE_COUNT + 1))
+    say "  ${C_CYA}[WORTH A LOOK]${C_OFF} $1"
+    say "                 ${C_DIM}$2${C_OFF}"
+}
 
 finding() {  # finding <FOUND|SUSPICIOUS> <what> <where>
     local sev="$1" what="$2" where="$3"
@@ -365,6 +384,104 @@ fi
 say "  ${C_DIM}Checked autostart entries, cron jobs and user services.${C_OFF}"
 say ""
 
+# -------------------------------------------------- --deep: behaviour checks
+#
+# Everything above matches indicators researchers have published. Those are
+# exact, but they are also the easiest thing in the world for the attacker to
+# change -- a recompiled map with a new server address defeats all of it.
+#
+# The checks below describe how this malware BEHAVES instead, so they can catch
+# a repackaged copy nobody has catalogued. The trade-off is that innocent files
+# can behave the same way, which is why they report as "worth a look" and never
+# as a confirmed finding.
+
+if [ "$DEEP" = 1 ]; then
+    say "${C_BLD}  Deep scan: looking for suspicious behaviour...${C_OFF}"
+
+    # -- B1: batch files in Documents at all -------------------------------
+    # Documents is a place for documents. A .bat or .cmd sitting there is not
+    # where anything legitimate normally puts one, and it is exactly where this
+    # malware writes its dropper -- no known indicator required to spot it.
+    for d in "${DROP_DIRS[@]}"; do
+        [ -d "$d" ] || continue
+        while IFS= read -r -d '' f; do
+            note "A batch file is sitting in a documents folder, which is unusual" "$f"
+        done < <(find "$d" -maxdepth 1 -type f \( -iname '*.bat' -o -iname '*.cmd' \) -print0 2>/dev/null)
+    done
+
+    # -- B2: the dropper pattern -------------------------------------------
+    # Not one string, but a combination: hide a PowerShell window, fetch
+    # something from the internet, drop it in a temp folder and run it. Any one
+    # of these alone is common enough in legitimate scripts; together they
+    # describe this malware family regardless of which server it calls.
+    HIDE_PAT='-w hidden|-windowstyle hidden|-ep bypass|-executionpolicy bypass|-nop |-noprofile|-enc |-encodedcommand'
+    FETCH_PAT='iwr |invoke-webrequest|downloadstring|downloadfile|certutil|bitsadmin|curl |wget '
+    EXEC_PAT='%temp%|\$env:temp|start /min|cmd /c|&exit'
+
+    scan_script_behaviour() {
+        local f="$1"
+        local body cats=0 which=""
+        body="$(LC_ALL=C tr -d '\000' < "$f" 2>/dev/null | tr 'A-Z' 'a-z')"
+        # "--" is required: HIDE_PAT begins with a hyphen, which grep would
+        # otherwise parse as its own options.
+        if echo "$body" | grep -qE -- "$HIDE_PAT";  then cats=$((cats+1)); which="${which}hidden window, "; fi
+        if echo "$body" | grep -qE -- "$FETCH_PAT"; then cats=$((cats+1)); which="${which}downloads from the internet, "; fi
+        if echo "$body" | grep -qE -- "$EXEC_PAT";  then cats=$((cats+1)); which="${which}runs from a temp folder, "; fi
+        if [ "$cats" -ge 2 ]; then
+            note "A script here behaves like this malware (${which%, })" "$f"
+        fi
+    }
+
+    for d in "${DROP_DIRS[@]}"; do
+        [ -d "$d" ] || continue
+        while IFS= read -r -d '' f; do
+            scan_script_behaviour "$f"
+        done < <(find "$d" -maxdepth 1 -type f \( -iname '*.bat' -o -iname '*.cmd' -o -iname '*.ps1' \) -print0 2>/dev/null)
+    done
+
+    # -- B3: Unreal capability abuse inside Workshop maps -------------------
+    # A community map is scenery. It has no legitimate reason to reach for the
+    # user's home directory or launch a process. Spotting the CAPABILITY rather
+    # than the payload is what catches a malicious map nobody has reported yet.
+    CAP_PAT='GetPlatformUserDir|SaveStringToFile|SaveStringArrayToFile|ExecuteConsoleCommand|LaunchURL|CreateProc|BP_RCE'
+    for root in "${STEAM_ROOTS[@]:-}"; do
+        content="$root/steamapps/workshop/content/$APPID"
+        [ -d "$content" ] || continue
+        while IFS= read -r -d '' pak; do
+            hit="$(LC_ALL=C tr -d '\000' < "$pak" 2>/dev/null | grep -oiE "$CAP_PAT" | head -1)"
+            if [ -n "$hit" ]; then
+                note "A map can write files or launch programs, which maps do not need (\"$hit\")" "$pak"
+            fi
+        done < <(find "$content" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
+    done
+
+    # -- B4: evidence that something already ran ----------------------------
+    # The only checks here that can still find anything after the files have
+    # been deleted. On Linux the game runs under Proton, so the Windows-side
+    # traces live inside the Wine prefix registry rather than the real system.
+    if [ "$SYNTHETIC" = 0 ]; then
+        for root in "${STEAM_ROOTS[@]:-}"; do
+            pfx="$root/steamapps/compatdata/$APPID/pfx"
+            [ -d "$pfx" ] || continue
+            for reg in "$pfx/user.reg" "$pfx/system.reg"; do
+                [ -r "$reg" ] || continue
+                while IFS= read -r line; do
+                    note "The game's Windows environment has a startup entry that runs a script" "$reg"
+                    break
+                done < <(grep -iE '\\\\run\\\\|\.bat|\.cmd' "$reg" 2>/dev/null | head -1)
+            done
+            while IFS= read -r -d '' f; do
+                note "A leftover script is inside the game's Windows environment" "$f"
+            done < <(find "$pfx/drive_c" -maxdepth 6 -type f \( -iname '*.bat' -o -iname '*.cmd' \) -print0 2>/dev/null | head -c 100000)
+        done
+    fi
+
+    if [ "$NOTE_COUNT" -eq 0 ]; then
+        say "  ${C_GRN}Nothing behaving suspiciously.${C_OFF}"
+    fi
+    say ""
+fi
+
 # ----------------------------------------------------------------- verdict
 
 say "  ${C_DIM}--------------------------------------------------------------${C_OFF}"
@@ -393,6 +510,23 @@ if [ "$FOUND_COUNT" -gt 0 ] || [ "$SUSPECT_COUNT" -gt 0 ]; then
     say "   6. Unsubscribe from the map in the Steam Workshop, and make sure"
     say "      Meccha Chameleon is updated to version 3.2.0 or later."
     say ""
+elif [ "$NOTE_COUNT" -gt 0 ]; then
+    EXIT=3
+    say "  ${C_CYA}${C_BLD}No known malware was found, but $NOTE_COUNT thing(s) are worth a look.${C_OFF}"
+    say ""
+    say "  ${C_BLD}Do not panic.${C_OFF} Nothing above matches this malware. The deep scan"
+    say "  flags anything that merely BEHAVES a bit like it, and ordinary files"
+    say "  can do that too -- a game launcher script, a modding tool, a backup"
+    say "  job. Most of the time this is a false alarm."
+    say ""
+    say "  ${C_BLD}This tool has changed nothing.${C_OFF} Nothing was deleted or moved."
+    say ""
+    say "  If you want to be sure, run a full scan with Microsoft Defender or"
+    say "  Malwarebytes, and open the files listed above in Notepad or a text"
+    say "  editor to see what they do. If a file downloads something from an"
+    say "  address you do not recognise and hides its window while doing it,"
+    say "  treat it the way you would a confirmed finding above."
+    say ""
 else
     say "  ${C_GRN}${C_BLD}No known indicators of this malware were found.${C_OFF}"
     say ""
@@ -408,6 +542,12 @@ else
     say "  treat this result with suspicion: run a full antivirus scan and change"
     say "  your passwords from a different device anyway."
     say ""
+    if [ "$DEEP" = 0 ]; then
+        say "  ${C_DIM}Tip: this checked for the exact malware researchers have published.${C_OFF}"
+        say "  ${C_DIM}To also look for files merely BEHAVING like it -- which can catch a${C_OFF}"
+        say "  ${C_DIM}repackaged copy -- run:  ./check-my-pc.sh --deep${C_OFF}"
+        say ""
+    fi
 fi
 
 # ------------------------------------------------------------- report file

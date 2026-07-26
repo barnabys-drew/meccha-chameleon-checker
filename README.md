@@ -74,6 +74,25 @@ chmod +x check-my-pc.sh
 > internet. Click **More info → Run anyway**. You can read every line of what it does first:
 > [`check-my-pc.bat`](check-my-pc.bat) is 20 lines long.
 
+### 🔬 Want a more thorough check?
+
+The normal check looks for the **exact** malware researchers have published. The attackers kept
+re-uploading new versions, and a repackaged copy has a different ID, a different file and a
+different server — so the normal check would miss it.
+
+The deep scan also looks for files that merely **behave** like this malware, which can catch a copy
+nobody has reported yet.
+
+| | |
+|---|---|
+| 🪟 **Windows** | Double-click **`check-my-pc-deep.bat`** |
+| 🐧 **Linux** | `./check-my-pc.sh --deep` |
+
+> [!WARNING]
+> The deep scan can point at **innocent files** — a game launcher, a modding tool, a backup script.
+> Anything it flags is labelled **"worth a look"**, not proof of infection. Read what it says
+> carefully rather than assuming the worst.
+
 ---
 
 ## 📖 Step 3 — Read your result
@@ -218,9 +237,31 @@ statements only — and marker strings are assembled from fragments at runtime.
 | `0` | No known indicators found |
 | `1` | Indicators found |
 | `2` | The scan could not run |
+| `3` | Deep scan only — behaviour worth a look, no known indicators |
 
-**Know of another malicious map ID?** Please open an issue — `indicators.json` currently carries
-only one confirmed ID, and replacement maps kept appearing after each takedown.
+### Detection coverage, honestly
+
+The IOC checks sit at the bottom of the Pyramid of Pain — a hash, an IP, a map ID — all trivially
+changed by the attacker. The `--deep` checks target behaviour instead:
+
+| Behaviour check | Catches |
+|---|---|
+| Batch/command file present in Documents | The drop location itself, no IOC needed |
+| Hidden window **and** download **and** temp-execute, together | Recompiled droppers with new infrastructure |
+| Workshop map carrying file-write / process-launch capability | Malicious maps nobody has reported yet |
+| Prefetch, Defender history, PowerShell 4104 logs | Infection whose files were already deleted |
+
+The test suite asserts this gap explicitly: a fixture representing a repackaged variant is **missed
+by the IOC checks and caught by `--deep`**.
+
+**How indicators get updated:** see [docs/IOC-PROCESS.md](docs/IOC-PROCESS.md). Short version — a
+scheduled agent researches new maps and techniques, everything passes
+`tools/validate-indicators.sh`, and each finding arrives as a pull request citing its source. **No
+indicator reaches `main` without a human approving it.**
+
+**Know of another malicious map ID?** Please
+[open an issue](../../issues/new?template=new-indicator.yml) — `indicators.json` currently carries
+only one confirmed ID.
 
 </details>
 

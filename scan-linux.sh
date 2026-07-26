@@ -73,23 +73,46 @@ APPID=$(grep -oE '"steam_appid"[[:space:]]*:[[:space:]]*"[0-9]+"' "$INDICATORS" 
 mapfile -t BAD_IDS < <(grep -oE '"id"[[:space:]]*:[[:space:]]*"[0-9]+"' "$INDICATORS" \
                        | grep -oE '[0-9]+')
 
-mapfile -t BAD_HASHES < <(grep -oiE '"[a-f0-9]{64}"' "$INDICATORS" | tr -d '"' | tr 'A-Z' 'a-z')
-
-# content_strings array -> one string per line
-mapfile -t BAD_STRINGS < <(
-    sed -n '/"content_strings"/,/]/p' "$INDICATORS" \
-    | grep -oE '"[^"]+"' | grep -v '^"content_strings"$' | sed 's/^"//; s/"$//'
+# Scoped to the file_hashes_sha256 block so a hash quoted anywhere else in the
+# file -- in a provenance note, say -- can never become a live indicator.
+mapfile -t BAD_HASHES < <(
+    sed -n '/"file_hashes_sha256"/,/^[[:space:]]*}/p' "$INDICATORS" \
+    | grep -oiE '"[a-f0-9]{64}"' | tr -d '"' | tr 'A-Z' 'a-z'
 )
 
-mapfile -t DROP_NAMES < <(
-    sed -n '/"dropped_filenames"/,/]/p' "$INDICATORS" \
-    | grep -oE '"[^"]+"' | grep -v '^"dropped_filenames"$' | sed 's/^"//; s/"$//'
-)
+# Pull one JSON string array by key.
+#
+# Newlines are flattened first and the match is bounded to the first "]" after
+# the key, so this works whether the array is on one line or many. Do not
+# replace this with a sed line range: sed looks for the range end on the line
+# AFTER the start, so a single-line array would silently swallow whichever key
+# came next.
+extract_array() {
+    tr '\n' ' ' < "$INDICATORS" \
+    | grep -oE "\"$1\"[[:space:]]*:[[:space:]]*\[[^]]*\]" \
+    | sed 's/^[^[]*\[//; s/\]$//' \
+    | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//'
+}
+
+mapfile -t BAD_STRINGS < <(extract_array content_strings)
+mapfile -t DROP_NAMES  < <(extract_array dropped_filenames)
 
 if [ -z "$APPID" ] || [ "${#BAD_HASHES[@]}" -eq 0 ] || [ "${#BAD_STRINGS[@]}" -eq 0 ]; then
     echo "ERROR: could not parse indicators from $INDICATORS -- refusing to report a" >&2
     echo "       misleading 'clean' result. The file may be corrupt." >&2
     exit 2
+fi
+
+# Undocumented, for the test suite: prove exactly what was parsed. Indicator
+# parsing bugs are invisible in normal output -- the scan still "works", it
+# just quietly matches the wrong things.
+if [ "${DUMP_INDICATORS:-0}" = "1" ]; then
+    printf 'APPID=%s\n' "$APPID"
+    for v in "${BAD_IDS[@]:-}";     do printf 'ID=%s\n' "$v"; done
+    for v in "${BAD_HASHES[@]}";    do printf 'HASH=%s\n' "$v"; done
+    for v in "${BAD_STRINGS[@]}";   do printf 'STRING=%s\n' "$v"; done
+    for v in "${DROP_NAMES[@]:-}";  do printf 'DROP=%s\n' "$v"; done
+    exit 0
 fi
 
 # ------------------------------------------------------------------ findings

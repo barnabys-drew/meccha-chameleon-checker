@@ -150,6 +150,46 @@ bash "$SCANNER" --scan-root "$CLEAN" --indicators "$FIX/bad.json" --no-color >/d
     && ok "exits 2 rather than reporting a false 'clean'" \
     || bad "exits 2 rather than reporting a false 'clean'"
 
+# ------------------------------------------- indicator parsing is exact
+#
+# Regression test for a real bug: a sed line range meant content_strings
+# swallowed the following key's values, and dropped_filenames ran to EOF.
+# The scan still "worked", it just quietly matched the wrong things -- which
+# is invisible in normal output, hence this assertion.
+
+echo
+echo "  Indicator parsing"
+echo "  -----------------"
+DUMP="$(DUMP_INDICATORS=1 bash "$SCANNER" --indicators "$REPO/indicators.json" 2>&1)"
+
+[ "$(echo "$DUMP" | grep -c '^STRING=')" -eq 4 ] \
+    && ok "parses exactly 4 content strings" \
+    || bad "parses exactly 4 content strings (got $(echo "$DUMP" | grep -c '^STRING='))"
+[ "$(echo "$DUMP" | grep -c '^DROP=')" -eq 1 ] \
+    && ok "parses exactly 1 dropped filename" \
+    || bad "parses exactly 1 dropped filename (got $(echo "$DUMP" | grep -c '^DROP='))"
+echo "$DUMP" | grep -qE '^(STRING|DROP)=(dropped_filenames|blueprint_asset|BP_AmbientController)' \
+    && bad "no key names leaked into the indicator lists" \
+    || ok "no key names leaked into the indicator lists"
+[ "$(echo "$DUMP" | grep -c '^HASH=')" -eq 4 ] \
+    && ok "parses exactly 4 hashes" \
+    || bad "parses exactly 4 hashes (got $(echo "$DUMP" | grep -c '^HASH='))"
+
+# ---------------------------------------------------- indicator validator
+
+echo
+echo "  Indicator validator"
+echo "  -------------------"
+bash "$REPO/tools/validate-indicators.sh" "$REPO/indicators.json" >/dev/null 2>&1 \
+    && ok "the shipped indicators.json passes validation" \
+    || bad "the shipped indicators.json passes validation"
+
+printf '{ "steam_appid": "4704690", "malicious_workshop_ids": [{"id":"abc"}], "file_hashes_sha256": {"tooshort":"x"}, "content_strings": [".bat"], "dropped_filenames": ["s.bat"], "updated": "2026-07-26" }\n' \
+    > "$FIX/invalid.json"
+bash "$REPO/tools/validate-indicators.sh" "$FIX/invalid.json" >/dev/null 2>&1 \
+    && bad "validator rejects a bad hash, non-numeric ID and generic string" \
+    || ok "validator rejects a bad hash, non-numeric ID and generic string"
+
 # ------------------------------------------------------------------ summary
 
 rm -f "$REPO"/meccha-check-report-*.txt 2>/dev/null

@@ -35,7 +35,7 @@ Answer these:
 
 ## ⬇️ Step 1 — Download it
 
-### [**📦 Click here to download**](../../archive/refs/heads/main.zip)
+### [**📦 Click here to download**](https://github.com/barnabys-drew/meccha-chameleon-checker/archive/refs/heads/main.zip)
 
 Then **right-click the downloaded ZIP → Extract All**. Keep all the files together in one folder.
 

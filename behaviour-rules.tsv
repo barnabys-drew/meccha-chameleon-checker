@@ -1,0 +1,84 @@
+# Behaviour rules for --deep scanning.
+#
+# Tab-separated:  weight <TAB> category <TAB> regex <TAB> plain-English description
+#
+# Both scanners read this one file, so Windows and Linux cannot drift apart.
+# Lines starting with # are comments. Blank lines are ignored.
+#
+# WRITING RULES
+#
+#   Regexes are matched case-insensitively against text that has already been
+#   lowercased, de-obfuscated and (where applicable) base64-decoded.
+#
+#   Use only the regex subset that GNU grep -E and .NET both understand:
+#     OK    \b  [a-z0-9]  [ \t]  {n,m}  ( | )  ?  *  +
+#     NOT   [[:space:]]  [[:alpha:]]  (?i)  lookbehind
+#   POSIX bracket classes work in grep but NOT in .NET, so they are banned.
+#
+#   Descriptions are shown to frightened non-technical people. Say what the
+#   script DOES, not what the technique is called. "hides its own window",
+#   not "WindowStyle Hidden evasion".
+#
+# SCORING
+#
+#   A file is reported when   total score >= 6   AND   >= 2 distinct categories.
+#   The two-category rule is what keeps false positives down: one loud signal
+#   is not enough, the file has to look suspicious in more than one way.
+#
+#   Weights, roughly:
+#     3 = strongly abnormal for a script sitting in someone's Documents folder
+#     2 = notable
+#     1 = common in legitimate scripts, only meaningful alongside others
+
+# ---------------------------------------------------------------- concealment
+3	concealment	-w[a-z]*[ \t]+hidden	hides its own window
+3	concealment	-e[a-z]*[ \t]+bypass	turns off PowerShell's script safety check
+3	concealment	-e[a-z]*[ \t]+[a-z0-9+/=]{20,}	runs a command hidden inside encoded text
+1	concealment	-nop\b|-noprofile\b	skips the user's normal PowerShell setup
+2	concealment	createnowindow	creates a window that cannot be seen
+3	concealment	\.run\([^)]*,[ \t]*0[ \t]*[,)]	runs a command with the window hidden
+2	concealment	start[ \t]+/(min|b)\b	starts minimised or with no window
+
+# ------------------------------------------------------------------- download
+3	download	\biwr\b|\birm\b|invoke-webrequest|invoke-restmethod	downloads a file from the internet
+3	download	net\.webclient|downloadstring|downloadfile|downloaddata|openread	downloads a file using .NET
+3	download	\bcertutil\b	uses certutil, a certificate tool often abused to download files
+3	download	\bbitsadmin\b|start-bitstransfer	downloads using a background Windows service
+3	download	msxml2\.xmlhttp|winhttp\.winhttprequest|system\.net\.http	downloads using a scripted web request
+2	download	\bcurl(\.exe)?\b|\bwget(\.exe)?\b	downloads with curl or wget
+3	download	https?://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}	contacts a bare IP address instead of a website name
+
+# --------------------------------------------------------------------- lolbin
+# Built-in Windows tools that can run code fetched from elsewhere. Separate
+# category so "mshta <ip>" reaches two categories on its own.
+3	lolbin	\bmshta\b	uses mshta, which runs code straight from a web page
+2	lolbin	\brundll32\b|\bregsvr32\b	uses a Windows utility often abused to run downloaded code
+2	lolbin	\bwmic\b[^\n]*process[^\n]*call	starts a program through WMI
+3	lolbin	\bmsiexec\b[^\n]*/i[^\n]*http	installs a package straight from the internet
+
+# -------------------------------------------------------------------- staging
+2	staging	%temp%|\$env:temp|\\appdata\\local\\temp	writes into a temporary folder
+3	staging	\biex\b|invoke-expression	runs downloaded text as code
+1	staging	cmd[ \t]*/c\b	chains another command
+1	staging	start-process	starts another program
+1	staging	&[ \t]*exit\b	quits immediately after running
+
+# ---------------------------------------------------------------- persistence
+3	persistence	schtasks[^\n]*/create	creates a scheduled task so it runs again later
+3	persistence	reg[ \t]+add[^\n]*\\run|\\currentversion\\run	adds itself to Windows startup
+2	persistence	\\start menu\\programs\\startup	copies itself into the Startup folder
+
+# ---------------------------------------------------------------- obfuscation
+# Hiding what a script does is itself a strong signal. Nothing legitimate needs
+# to disguise its own command names.
+3	obfuscation	frombase64string	decodes hidden text back into commands
+3	obfuscation	'[ \t]*\+[ \t]*'	splits words apart so they are harder to recognise
+2	obfuscation	\[char\]|-join	builds commands out of character codes
+2	obfuscation	[a-z0-9+/]{100,}={0,2}	contains a long block of encoded text
+2	obfuscation	%[a-z0-9_]+%%[a-z0-9_]+%	builds commands by gluing variables together
+
+# -------------------------------------------------------------- self-relaunch
+# The toolmark of this specific family: relaunch yourself once, hidden, using a
+# marker variable so the second run behaves differently.
+2	self_relaunch	%~f0|%~dpnx0|%~dp0%~nx0	re-runs its own file
+3	self_relaunch	if[ \t]+not[ \t]+defined[ \t]+[a-z0-9_]+	uses a marker variable to re-run itself once

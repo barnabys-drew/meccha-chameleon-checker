@@ -59,6 +59,13 @@ function Add-Note {
     Say "                 $Where" 'DarkGray'
 }
 
+# Observations too weak to alarm anyone with on their own -- "you have a .bat
+# file in Documents" is true of plenty of innocent machines. Shown as context,
+# deliberately NOT counted toward the verdict or the exit code: six cyan alerts
+# on a clean PC teaches people to ignore the alerts that matter.
+$script:InfoLines = New-Object System.Collections.Generic.List[string]
+function Add-Info { param([string]$Path) $script:InfoLines.Add($Path) }
+
 # ------------------------------------------------------------ indicator load
 #
 # If the indicator list fails to load we abort with exit 2. A scanner that
@@ -387,35 +394,135 @@ Say ''
 if ($Deep) {
     Say '  Deep scan: looking for suspicious behaviour...' 'White'
 
-    $hidePat  = '-w\s+hidden|-windowstyle\s+hidden|-ep\s+bypass|-executionpolicy\s+bypass|-nop\b|-noprofile|-enc\b|-encodedcommand'
-    $fetchPat = '\biwr\b|invoke-webrequest|downloadstring|downloadfile|certutil|bitsadmin|\bcurl\b|\bwget\b'
-    $execPat  = '%temp%|\$env:temp|start\s+/min|cmd\s+/c|&\s*exit'
+    $BehavMinScore = 6       # total weight needed to report a file
+    $BehavMinCats  = 2       # ...in at least this many different categories
+    $BehavMaxBytes = 524288  # only analyse the first 512 KB of any script
 
-    # -- B1 and B2: batch files where they do not belong, and what they do ---
-    # Documents is a place for documents. A .bat or .cmd sitting there is not
-    # where anything legitimate normally puts one, and it is exactly where this
-    # malware writes its dropper -- no known indicator required to spot it.
-    #
-    # B2 is a combination rather than one string: hide a window, fetch
-    # something, run it from a temp folder. Any one alone is common in
-    # legitimate scripts; together they describe this malware family whichever
-    # server it happens to call.
+    # Rules live in behaviour-rules.tsv so both scanners share one definition.
+    # Losing them must not silently turn the deep scan into a no-op.
+    $rulesFile = Join-Path $ScriptDir 'behaviour-rules.tsv'
+    $BehavRules = @()
+    if (Test-Path -LiteralPath $rulesFile) {
+        foreach ($line in (Get-Content -LiteralPath $rulesFile -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*(#|$)') { continue }
+            $parts = $line -split "`t"
+            if ($parts.Count -lt 4) { continue }
+            $BehavRules += [pscustomobject]@{
+                Weight = [int]$parts[0]; Category = $parts[1]
+                Regex  = $parts[2];      Description = $parts[3]
+            }
+        }
+    }
+    if ($BehavRules.Count -lt 5) {
+        Write-Error "-Deep needs behaviour-rules.tsv, which is missing or unreadable: $rulesFile"
+        Write-Error "Refusing to report 'nothing suspicious' from a scan that could not run."
+        exit 2
+    }
+
+    $execExt = '^\.(bat|cmd|ps1|psm1|vbs|vbe|js|jse|wsf|hta)$'
+    $oddExt  = '^\.(bat|cmd|vbs|js|wsf|hta|scr|pif|lnk)$'
+    $behavSeen = @{}
+
+    # ---- de-obfuscation ---------------------------------------------------
+    # Attackers break up their own command names so a literal search misses
+    # them: caret escapes in batch, backticks in PowerShell, quote-splitting.
+    # We score twice -- as written, and with the tricks undone -- and keep the
+    # higher result. The obfuscation itself is scored too, since nothing
+    # legitimate needs to disguise its own commands.
+    function Get-Deobfuscated {
+        param([string]$Text)
+        ($Text -replace '\^','' -replace '`','' `
+               -replace "'[ \t]*\+[ \t]*'",'' -replace '"[ \t]*\+[ \t]*"','' `
+               -replace '[ \t]+',' ')
+    }
+
+    # PowerShell -EncodedCommand payloads are UTF-16LE base64. Decode any long
+    # base64 run so a fully encoded dropper is scored on what it actually does,
+    # not merely on the fact that it is encoded. Must run against the
+    # case-preserved text: base64 is case-sensitive, and decoding lowercased
+    # input silently yields nothing.
+    function Get-DecodedBase64 {
+        param([string]$Raw)
+        $out = New-Object System.Text.StringBuilder
+        $n = 0
+        foreach ($m in [regex]::Matches($Raw, '[A-Za-z0-9+/]{40,}={0,2}')) {
+            if ($n -ge 20) { break }
+            $n++
+            $s = $m.Value
+            $s = $s.Substring(0, $s.Length - ($s.Length % 4))
+            if ($s.Length -lt 4) { continue }
+            try {
+                $bytes = [Convert]::FromBase64String($s)
+                [void]$out.AppendLine([System.Text.Encoding]::Unicode.GetString($bytes))
+                [void]$out.AppendLine([System.Text.Encoding]::ASCII.GetString($bytes))
+            } catch { }
+        }
+        $out.ToString()
+    }
+
+    # ---- scoring ----------------------------------------------------------
+    function Get-BehaviourScore {
+        param([string]$Text)
+        $score = 0; $cats = @(); $why = @()
+        foreach ($r in $BehavRules) {
+            try { $hit = [regex]::IsMatch($Text, $r.Regex, 'IgnoreCase') } catch { continue }
+            if ($hit) {
+                $score += $r.Weight
+                if ($cats -notcontains $r.Category)    { $cats += $r.Category }
+                if ($why  -notcontains $r.Description) { $why  += $r.Description }
+            }
+        }
+        # Count-based signals the rule table cannot express.
+        $carets = ([regex]::Matches($Text, '\^')).Count
+        $ticks  = ([regex]::Matches($Text, '`')).Count
+        if ($carets -ge 4 -or $ticks -ge 4) {
+            $score += $(if ($carets -ge 4) { 3 } else { 2 })
+            if ($cats -notcontains 'obfuscation') { $cats += 'obfuscation' }
+            $d = 'disguises its commands with escape characters'
+            if ($why -notcontains $d) { $why += $d }
+        }
+        [pscustomobject]@{ Score = $score; Cats = $cats.Count; Why = ($why -join '; ') }
+    }
+
+    function Test-FileBehaviour {
+        param([string]$Path)
+        $raw = ''
+        try {
+            $fs  = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+            $buf = New-Object byte[] $BehavMaxBytes
+            $n   = $fs.Read($buf, 0, $BehavMaxBytes)
+            $fs.Dispose()
+            $raw = [System.Text.Encoding]::GetEncoding(28591).GetString($buf, 0, $n) -replace "`0", ''
+        } catch { return $null }
+
+        $lower = $raw.ToLowerInvariant()
+        $best  = Get-BehaviourScore -Text $lower
+
+        $pass2 = (Get-Deobfuscated -Text $lower) + "`n" +
+                 (Get-DecodedBase64 -Raw $raw).ToLowerInvariant()
+        $alt = Get-BehaviourScore -Text $pass2
+        if ($alt.Score -gt $best.Score) { $best = $alt }
+
+        if ($best.Score -ge $BehavMinScore -and $best.Cats -ge $BehavMinCats) { return $best }
+        return $null
+    }
+
+    # -- B1/B2: scripts near the drop location ------------------------------
+    # Depth 3 because a dropper can just as easily write into a subfolder.
     foreach ($d in $dropDirs) {
-        $scripts = Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Extension -match '^\.(bat|cmd|ps1)$' }
-        foreach ($s in $scripts) {
-            if ($s.Extension -match '^\.(bat|cmd)$') {
-                Add-Note 'A batch file is sitting in a documents folder, which is unusual' $s.FullName
+        $files = Get-ChildItem -LiteralPath $d -File -Recurse -Depth 2 -ErrorAction SilentlyContinue
+        foreach ($s in ($files | Where-Object { $_.Extension -match $execExt })) {
+            if ($behavSeen.ContainsKey($s.FullName)) { continue }
+            $r = Test-FileBehaviour -Path $s.FullName
+            if ($r) {
+                $behavSeen[$s.FullName] = $true
+                Add-Note "This script behaves like the malware: $($r.Why)" $s.FullName
             }
-            $body = ''
-            try { $body = (Get-Content -LiteralPath $s.FullName -Raw -ErrorAction Stop).ToLower() } catch { continue }
-            $cats = @()
-            if ($body -match $hidePat)  { $cats += 'hidden window' }
-            if ($body -match $fetchPat) { $cats += 'downloads from the internet' }
-            if ($body -match $execPat)  { $cats += 'runs from a temp folder' }
-            if ($cats.Count -ge 2) {
-                Add-Note "A script here behaves like this malware ($($cats -join ', '))" $s.FullName
-            }
+        }
+        foreach ($s in ($files | Where-Object { $_.Extension -match $oddExt })) {
+            if ($behavSeen.ContainsKey($s.FullName)) { continue }
+            $behavSeen[$s.FullName] = $true
+            Add-Info $s.FullName
         }
     }
 
@@ -423,17 +530,26 @@ if ($Deep) {
     # A community map is scenery. It has no legitimate reason to reach for the
     # user's home directory or launch a process. Spotting the CAPABILITY rather
     # than the payload is what catches a malicious map nobody has reported yet.
+    #
+    # Two or more DISTINCT capabilities are required: one incidental match in a
+    # large binary is not worth frightening anyone over, but writing a file AND
+    # launching something is a different matter.
     $capMarkers = @('GetPlatformUserDir','SaveStringToFile','SaveStringArrayToFile',
-                    'ExecuteConsoleCommand','LaunchURL','CreateProc','BP_RCE')
+                    'ExecuteConsoleCommand','LaunchURL','CreateProc','BP_RCE',
+                    'WriteStringToFile','FileSaveDialog')
     foreach ($root in $SteamRoots) {
         $content = Join-Path $root "steamapps\workshop\content\$AppId"
         if (-not (Test-Path -LiteralPath $content)) { continue }
         $paks = Get-ChildItem -LiteralPath $content -Recurse -File -ErrorAction SilentlyContinue |
                 Where-Object { $_.Extension -match '^\.(pak|utoc|ucas)$' }
         foreach ($pak in $paks) {
-            $hit = Test-ContainsMarker -Path $pak.FullName -Markers $capMarkers
-            if ($hit) {
-                Add-Note "A map can write files or launch programs, which maps do not need (`"$hit`")" $pak.FullName
+            $found = @()
+            foreach ($m in $capMarkers) {
+                if (Test-ContainsMarker -Path $pak.FullName -Markers @($m)) { $found += $m }
+                if ($found.Count -ge 2) { break }
+            }
+            if ($found.Count -ge 2) {
+                Add-Note "A map can write files or launch programs, which maps do not need ($($found -join ', '))" $pak.FullName
             }
         }
     }
@@ -494,6 +610,23 @@ if ($Deep) {
     }
 
     if ($script:NoteCount -eq 0) { Say '  Nothing behaving suspiciously.' 'Green' }
+
+    # Context, printed quietly and only if there is something to say.
+    if ($script:InfoLines.Count -gt 0) {
+        Say ''
+        Say "  For reference, $($script:InfoLines.Count) program-type file(s) live in your documents" 'DarkGray'
+        Say '  folders. That is normal on plenty of PCs and none of them behaved' 'DarkGray'
+        Say '  suspiciously above -- listed only so you can recognise anything you' 'DarkGray'
+        Say '  did not put there yourself:' 'DarkGray'
+        $i = 0
+        foreach ($l in $script:InfoLines) {
+            $i++
+            if ($i -gt 8) { Say "      ...and $($script:InfoLines.Count - 8) more" 'DarkGray'; break }
+            Say "      $l" 'DarkGray'
+        }
+    }
+
+    Say "  Applied $($BehavRules.Count) behaviour rules." 'DarkGray'
     Say ''
 }
 

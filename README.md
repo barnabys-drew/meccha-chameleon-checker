@@ -244,15 +244,26 @@ statements only — and marker strings are assembled from fragments at runtime.
 The IOC checks sit at the bottom of the Pyramid of Pain — a hash, an IP, a map ID — all trivially
 changed by the attacker. The `--deep` checks target behaviour instead:
 
+`--deep` is a weighted scoring engine, not a pattern list. Rules live in
+[`behaviour-rules.tsv`](behaviour-rules.tsv), shared by both scanners so they cannot drift apart. A
+file is reported only when its score reaches 6 **and** its signals span at least two different
+categories — one loud signal is never enough.
+
 | Behaviour check | Catches |
 |---|---|
-| Batch/command file present in Documents | The drop location itself, no IOC needed |
-| Hidden window **and** download **and** temp-execute, together | Recompiled droppers with new infrastructure |
-| Workshop map carrying file-write / process-launch capability | Malicious maps nobody has reported yet |
-| Prefetch, Defender history, PowerShell 4104 logs | Infection whose files were already deleted |
+| Scripts near the drop location, scored against 33 rules | Recompiled droppers with new infrastructure |
+| Workshop map carrying file-write **and** process-launch capability | Malicious maps nobody has reported yet |
+| Prefetch, Defender history, PowerShell 4104, Wine registry | Infection whose files were already deleted |
+| Program-type files merely sitting in Documents | Context only — never counted as a finding |
 
-The test suite asserts this gap explicitly: a fixture representing a repackaged variant is **missed
-by the IOC checks and caught by `--deep`**.
+Every file is scored twice, once as written and once with caret/backtick escaping, quote-splitting
+and **base64 undone**, so an encoded payload is judged on what it actually does. Obfuscation is
+itself scored: nothing legitimate needs to disguise its own command names.
+
+**Both halves are tested.** `tests/corpus.*` builds 14 evasion variants that must all be caught, and
+8 ordinary scripts that must all be ignored. Current state: **14/14 caught, 0/8 false positives, on
+both platforms.** The suite also asserts that a repackaged variant is missed by the IOC checks and
+caught by `--deep`.
 
 **Full technical write-up:** [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) — how every check works,
 the design constraints that must not be reversed, and an honest list of **what the tool can't do

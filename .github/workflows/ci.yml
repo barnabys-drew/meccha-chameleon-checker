@@ -27,6 +27,13 @@ jobs:
       - name: Confirm it is valid JSON
         run: python3 -c "import json,sys; json.load(open('indicators.json')); print('valid JSON')"
 
+      # Both scanners read behaviour-rules.tsv. A rule that fails to compile is
+      # skipped at runtime, which looks identical to "nothing suspicious found",
+      # and a POSIX bracket class matches on Linux while silently never firing
+      # on Windows. Neither is visible without this check.
+      - name: Validate behaviour rules
+        run: bash tools/validate-rules.sh
+
   test-linux:
     name: Tests (Linux)
     runs-on: ubuntu-latest
@@ -55,5 +62,7 @@ jobs:
           # SC2086 (word splitting) and SC2295 are noisy against the deliberate
           # globbing style used here; everything else must pass.
           shellcheck -e SC2086,SC2295 scan-linux.sh check-my-pc.sh \
-                                      tools/validate-indicators.sh || true
-          shellcheck -S error scan-linux.sh check-my-pc.sh tools/validate-indicators.sh
+                                      tools/validate-indicators.sh tools/validate-rules.sh \
+                                      tests/corpus.sh || true
+          shellcheck -S error scan-linux.sh check-my-pc.sh \
+                              tools/validate-indicators.sh tools/validate-rules.sh

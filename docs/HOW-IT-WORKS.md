@@ -39,13 +39,16 @@ infected machine — the worst possible output.
 
 | File | Role |
 |---|---|
-| `indicators.json` | Single source of truth. Both scanners read it; neither hardcodes an indicator. |
+| `indicators.json` | Known indicators. Both scanners read it; neither hardcodes one. |
+| `behaviour-rules.tsv` | Weighted behaviour rules for `--deep`. Also shared by both scanners. |
 | `scan-windows.ps1` | Windows scanner. PowerShell 5.1, stock on Win10/11. No modules. |
 | `scan-linux.sh` | Linux scanner. bash 4+, coreutils. No jq. |
 | `check-my-pc.bat` / `.sh` | Double-clickable wrappers. Deliberately tiny so they can be read. |
 | `check-my-pc-deep.bat` | Same, with `-Deep`. |
-| `tools/validate-indicators.sh` | The gate. Runs in CI on every PR. |
+| `tools/validate-indicators.sh` | Indicator gate. Runs in CI on every PR. |
+| `tools/validate-rules.sh` | Behaviour-rule gate: field count, weights, regex compiles, no POSIX classes. |
 | `tests/make-fixtures.*` | Generate fixture trees, run the scanners, assert behaviour. |
+| `tests/corpus.*` | The evasion and benign corpora — the real contract for `--deep`. |
 
 **Zero dependencies is a hard requirement.** The audience is a panicking teenager who just wants to
 know if their PC is infected. "First install Python" loses most of them. That's why there are two
@@ -79,21 +82,71 @@ encodings — Unreal string literals are commonly UTF-16.
 
 The IOC checks sit at the bottom of the Pyramid of Pain — a hash, an IP, a map ID. The attackers
 re-uploaded replacement maps within hours of each takedown, so IOC-only matching is permanently one
-step behind. `--deep` targets behaviour instead:
+step behind. `--deep` targets behaviour instead.
 
-| Check | Catches | False-positive risk |
+**It is a weighted scoring engine, not a pattern list.** Rules live in
+[`behaviour-rules.tsv`](../behaviour-rules.tsv) — tab-separated `weight`, `category`, `regex`,
+`plain-English description` — and **both scanners read that same file**, so Windows and Linux cannot
+drift apart. A file is reported only when:
+
+```
+total score >= 6   AND   signals span >= 2 different categories
+```
+
+The two-category rule is what keeps false positives down. One loud signal is never enough; a file
+has to look wrong in more than one way. Categories: `concealment`, `download`, `lolbin`, `staging`,
+`persistence`, `obfuscation`, `self_relaunch`.
+
+#### De-obfuscation
+
+Every file is scored **twice** — as written, and again after undoing the common tricks — and the
+higher result wins:
+
+- **Caret and backtick escaping** stripped (`p^o^w^e^r^s^h^e^l^l`, ``i`w`r``)
+- **Quote-splitting** collapsed (`'i'+'w'+'r'`)
+- **Base64 decoded and re-scored**, so a `-EncodedCommand` payload is judged on what it actually
+  does rather than on the single fact that it is encoded
+
+Obfuscation is *itself* scored. Nothing legitimate needs to disguise its own command names, so heavy
+caret use or a long base64 blob contributes to the total on its own.
+
+> **Trap:** decoding must read the **case-preserved** text. Base64 is case-sensitive, and the
+> lowercased copy used for matching decodes to nothing — which looks exactly like "this file was not
+> obfuscated". This was a real bug during development.
+
+#### The four checks
+
+| Check | Catches | False-positive control |
 |---|---|---|
-| `.bat`/`.cmd` present in Documents at all | The drop location itself | Low |
-| Hidden-window **AND** fetch **AND** temp-execute | Recompiled droppers, new C2 | Low — needs 2 of 3 categories |
-| Workshop pak referencing file-write / process-launch capability | Unreported malicious maps | Medium |
-| Prefetch, Defender history, PowerShell 4104 | Infection whose files were deleted | Low, but needs admin |
+| Scripts in Documents (depth 3) scored against the rule table | Recompiled droppers with new infrastructure | Score + category thresholds |
+| Program-type files merely *located* in Documents | The drop location itself | Reported as **context only** — does not count toward the verdict or exit code |
+| Workshop pak referencing file-write / process-launch capability | Unreported malicious maps | Requires **two distinct** capabilities, not one |
+| Prefetch, Defender history, PowerShell 4104, Wine prefix registry | Infection whose files were deleted | Narrowly scoped; needs admin for Prefetch |
+
+Analysed extensions: `.bat .cmd .ps1 .psm1 .vbs .vbe .js .jse .wsf .hta`. Depth 3, because a dropper
+can just as easily write into a subfolder.
 
 Results report as `WORTH A LOOK` and set **exit 3**, distinct from a confirmed finding. The verdict
-text opens with "Do not panic" and explains that ordinary files behave this way too.
+opens with "Do not panic" and explains that ordinary files behave this way too.
 
-The test suite asserts this gap rather than describing it: a fixture representing a repackaged
-variant — new map ID, new hash, new C2 — is **missed by the IOC checks and caught by `--deep`**,
-while a clean tree stays silent in both modes.
+#### The corpus is the contract
+
+`tests/corpus.sh` and `tests/corpus.ps1` build two sets, and **both halves are load-bearing**:
+
+- **`evasion/`** — 14 variants an attacker could realistically ship tomorrow. Every one must be
+  detected. These exist because the first version of the deep scan **missed three of them**:
+  `-exec bypass` with `irm` (PowerShell accepts any unambiguous parameter prefix), a fully
+  base64-encoded command, and `mshta`.
+- **`benign/`** — 8 ordinary scripts a real person might have. **None** may be flagged. A behaviour
+  scanner that cries wolf is worse than none at all, because this audience cannot tell a false alarm
+  from a real one.
+
+Current state: **14/14 evasion detected, 0/8 benign flagged, on both platforms.** The suites also
+assert that the base64 variant is caught on its *decoded* contents, not merely on being encoded —
+otherwise the decoder would be decoration.
+
+Losing the rule file exits `2`. A deep scan that could not run must never print "nothing behaving
+suspiciously".
 
 ### Exit codes
 
@@ -134,9 +187,28 @@ The Windows side uses `ConvertFrom-Json` and was never affected.
 
 ```bash
 bash tools/validate-indicators.sh                                            # gate any indicator edit
+bash tools/validate-rules.sh                                                 # gate any behaviour-rule edit
 bash tests/make-fixtures.sh                                                  # Linux suite
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\make-fixtures.ps1   # Windows suite
+bash tests/corpus.sh /tmp/corpus && find /tmp/corpus -type f                 # inspect the corpus
 ```
+
+### Adding a behaviour rule
+
+1. Add a line to `behaviour-rules.tsv`: `weight <TAB> category <TAB> regex <TAB> description`.
+2. Use only the regex subset GNU grep **and** .NET both understand. `\b`, `[ \t]`, `{n,m}`,
+   `( | )` are fine. **POSIX bracket classes like `[[:space:]]` are banned** — they work in grep and
+   silently never match in .NET, so the rule would fire on Linux and quietly do nothing on Windows.
+   `tools/validate-rules.sh` rejects them.
+3. Write the description for a frightened non-technical reader: say what the script *does* ("hides
+   its own window"), never what the technique is called.
+4. **Add an evasion case to both corpora** if the rule exists to catch something new, and re-run both
+   suites. A rule with no corpus case is a rule nobody will notice breaking.
+5. Re-run the benign corpus. If your rule flags an ordinary script, lower its weight or narrow it —
+   do not lower the thresholds.
+
+Weights, roughly: `3` strongly abnormal for a script in someone's Documents, `2` notable, `1` common
+in legitimate scripts and only meaningful alongside others.
 
 CI runs both suites (Linux and a real `windows-latest` runner), the validator, a JSON parse, and
 shellcheck.
@@ -198,6 +270,13 @@ Only `steamapps/workshop/content/<appid>/` is examined. Not covered: `workshop/d
 downloads), legacy `ugc/` paths, `steamcmd`-based installs, and manually extracted maps sitting in
 the game's own `Content/Paks/~mods` folder. Straightforward to add; just needs someone with those
 setups to confirm the real paths.
+
+### 6b. Behaviour rules cover scripts, not binaries — *medium*
+
+The scoring engine reads scripts (`.bat`, `.ps1`, `.vbs`, …). A dropper that ships a compiled `.exe`
+or `.dll` instead is scored on nothing — there are no command lines to read. Import-table analysis
+(`URLDownloadToFile`, `WinExec`, `CreateProcess`) would be the equivalent signal, but that means a PE
+parser and a real false-positive problem, since ordinary programs import those too.
 
 ### 7. Thin Windows execution evidence — *medium, needs Windows internals knowledge*
 

@@ -195,7 +195,7 @@ echo "$OUT_VAR_IOC" | grep -qF "No known indicators of this malware were found" 
 [ "$RC_VAR_IOC" -eq 0 ] \
     && ok "IOC-only exits 0 on the variant"       || bad "IOC-only exits 0 on the variant (got $RC_VAR_IOC)"
 
-echo "$OUT_VAR_DEEP" | grep -qF "behaves like this malware" \
+echo "$OUT_VAR_DEEP" | grep -qF "behaves like the malware" \
     && ok "--deep catches the dropper pattern"    || bad "--deep catches the dropper pattern"
 echo "$OUT_VAR_DEEP" | grep -qF "launch programs, which maps do not need" \
     && ok "--deep catches Unreal capability abuse" || bad "--deep catches Unreal capability abuse"
@@ -214,6 +214,78 @@ OUT_CLEAN_DEEP="$(bash "$SCANNER" --deep --scan-root "$CLEAN" --indicators "$REP
 RC_CLEAN_DEEP=$?
 [ "$RC_CLEAN_DEEP" -eq 0 ] \
     && ok "--deep stays quiet on a clean system"  || bad "--deep stays quiet on a clean system (got $RC_CLEAN_DEEP)"
+
+# ------------------------------------ behaviour corpus: evasion + benign
+#
+# The corpus is the real contract for --deep. Detection has to survive an
+# attacker rewriting the dropper, and it has to stay silent on ordinary files.
+# Both halves are load-bearing: a scanner that flags everything is as useless
+# as one that flags nothing, because the audience cannot tell the difference.
+
+echo
+echo "  Behaviour corpus"
+echo "  ----------------"
+
+# shellcheck source=corpus.sh
+. "$HERE/corpus.sh"
+CORP="$FIX/corpus"
+corpus_build "$CORP"
+
+EV_ROOT="$FIX/ev"; BN_ROOT="$FIX/bn"
+mkdir -p "$EV_ROOT/home/Documents" "$EV_ROOT/steamroot/steamapps"
+mkdir -p "$BN_ROOT/home/Documents" "$BN_ROOT/steamroot/steamapps"
+cp -r "$CORP/evasion/." "$EV_ROOT/home/Documents/"
+cp    "$CORP/benign/"*  "$BN_ROOT/home/Documents/"
+
+EV_TOTAL=$(find "$CORP/evasion" -type f | wc -l)
+OUT_EV="$(bash "$SCANNER" --deep --scan-root "$EV_ROOT" --indicators "$REPO/indicators.json" --no-color 2>&1)"
+RC_EV=$?
+EV_HITS=$(printf '%s' "$OUT_EV" | grep -c 'behaves like the malware' || true)
+
+printf '  evasion variants detected: %s/%s\n' "$EV_HITS" "$EV_TOTAL"
+[ "$EV_HITS" -eq "$EV_TOTAL" ] \
+    && ok "every evasion variant is detected"     || bad "every evasion variant is detected ($EV_HITS/$EV_TOTAL)"
+[ "$RC_EV" -eq 3 ] \
+    && ok "evasion corpus exits 3"                || bad "evasion corpus exits 3 (got $RC_EV)"
+
+# Name the specific regressions that motivated the rewrite, so a future change
+# that reintroduces one fails with a message saying which.
+for spec in "02-abbrev-irm:parameter abbreviation and Invoke-RestMethod" \
+            "04-base64:fully base64-encoded payload" \
+            "05-caret:batch caret obfuscation" \
+            "08-mshta:mshta as the downloader" \
+            "15-subfolder:dropper in a Documents SUBfolder"; do
+    f="${spec%%:*}"; desc="${spec#*:}"
+    printf '%s' "$OUT_EV" | grep -q "$f" \
+        && ok "catches $desc"                     || bad "catches $desc"
+done
+
+# The base64 variant must be scored on its DECODED contents, not merely on the
+# fact that something is encoded -- otherwise the decoder is decoration.
+printf '%s' "$OUT_EV" | grep -A0 '04-base64' >/dev/null 2>&1
+printf '%s' "$OUT_EV" | grep -B1 '04-base64' | grep -qE 'runs downloaded text as code|downloads a file using .NET' \
+    && ok "base64 payload is decoded and scored, not just noticed" \
+    || bad "base64 payload is decoded and scored, not just noticed"
+
+OUT_BN="$(bash "$SCANNER" --deep --scan-root "$BN_ROOT" --indicators "$REPO/indicators.json" --no-color 2>&1)"
+RC_BN=$?
+BN_HITS=$(printf '%s' "$OUT_BN" | grep -c 'behaves like the malware' || true)
+
+printf '  benign scripts flagged:    %s (want 0)\n' "$BN_HITS"
+[ "$BN_HITS" -eq 0 ] \
+    && ok "no false positives on ordinary scripts" || bad "no false positives on ordinary scripts ($BN_HITS)"
+[ "$RC_BN" -eq 0 ] \
+    && ok "benign corpus exits 0"                  || bad "benign corpus exits 0 (got $RC_BN)"
+printf '%s' "$OUT_BN" | grep -q 'WORTH A LOOK' \
+    && bad "benign corpus raises no alarms at all" || ok "benign corpus raises no alarms at all"
+
+# Losing the rule file must fail loudly rather than report a clean deep scan.
+mv "$REPO/behaviour-rules.tsv" "$FIX/rules.bak"
+bash "$SCANNER" --deep --scan-root "$BN_ROOT" --indicators "$REPO/indicators.json" --no-color >/dev/null 2>&1
+[ $? -eq 2 ] \
+    && ok "missing behaviour rules exits 2, not a false 'clean'" \
+    || bad "missing behaviour rules exits 2, not a false 'clean'"
+mv "$FIX/rules.bak" "$REPO/behaviour-rules.tsv"
 
 # ------------------------------------------- indicator parsing is exact
 #

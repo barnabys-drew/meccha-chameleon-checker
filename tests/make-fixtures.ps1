@@ -176,7 +176,7 @@ $RcVarDeep = $LASTEXITCODE
 # -Deep, a repackaged copy is invisible.
 Check ($OutVarIoc -match 'No known indicators of this malware were found') 'IOC-only mode misses the variant (documents the limitation)'
 Check ($RcVarIoc -eq 0)                                                    "IOC-only exits 0 on the variant (got $RcVarIoc)"
-Check ($OutVarDeep -match 'behaves like this malware')                     '-Deep catches the dropper pattern'
+Check ($OutVarDeep -match 'behaves like the malware')                     '-Deep catches the dropper pattern'
 Check ($OutVarDeep -match 'launch programs, which maps do not need')       '-Deep catches Unreal capability abuse'
 Check ($OutVarDeep -match 'worth a look')                                  '-Deep wording avoids claiming infection'
 Check ($OutVarDeep -match 'Do not panic')                                  '-Deep tells the user most hits are false alarms'
@@ -187,6 +187,72 @@ Check ($RcVarDeep -eq 3)                                                   "-Dee
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
     -ScanRoot $Clean -Indicators $RealIoc -NoColor -Deep 2>&1 | Out-Null
 Check ($LASTEXITCODE -eq 0) "-Deep stays quiet on a clean system (got $LASTEXITCODE)"
+
+# ----------------------------------- behaviour corpus: evasion + benign
+#
+# The corpus is the real contract for -Deep. Detection has to survive an
+# attacker rewriting the dropper, and stay silent on ordinary files. Both
+# halves are load-bearing: a scanner that flags everything is as useless as
+# one that flags nothing, because the audience cannot tell the difference.
+
+Write-Host ''
+Write-Host '  Behaviour corpus'
+Write-Host '  ----------------'
+
+. (Join-Path $Here 'corpus.ps1')
+$Corp = Join-Path $Fix 'corpus'
+Build-Corpus -Root $Corp
+
+$EvRoot = Join-Path $Fix 'ev'; $BnRoot = Join-Path $Fix 'bn'
+New-Item -ItemType Directory -Path "$EvRoot\home\Documents" -Force | Out-Null
+New-Item -ItemType Directory -Path "$BnRoot\home\Documents" -Force | Out-Null
+Copy-Item "$Corp\evasion\*" "$EvRoot\home\Documents\" -Recurse -Force
+Copy-Item "$Corp\benign\*"  "$BnRoot\home\Documents\" -Force
+
+$EvTotal = (Get-ChildItem "$Corp\evasion" -Recurse -File).Count
+$OutEv = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
+            -ScanRoot $EvRoot -Indicators $RealIoc -NoColor -Deep 2>&1 | Out-String
+$RcEv = $LASTEXITCODE
+$EvHits = ([regex]::Matches($OutEv, 'behaves like the malware')).Count
+
+Write-Host "  evasion variants detected: $EvHits/$EvTotal"
+Check ($EvHits -eq $EvTotal) "every evasion variant is detected ($EvHits/$EvTotal)"
+Check ($RcEv -eq 3)          "evasion corpus exits 3 (got $RcEv)"
+
+# Name the specific regressions that motivated the rewrite, so a future change
+# that reintroduces one fails with a message saying which.
+foreach ($spec in @(
+    @('02-abbrev-irm','parameter abbreviation and Invoke-RestMethod'),
+    @('04-base64',    'fully base64-encoded payload'),
+    @('05-caret',     'batch caret obfuscation'),
+    @('08-mshta',     'mshta as the downloader'),
+    @('15-subfolder', 'dropper in a Documents SUBfolder'))) {
+    Check ($OutEv -match [regex]::Escape($spec[0])) "catches $($spec[1])"
+}
+
+# The base64 variant must be scored on its DECODED contents, not merely on the
+# fact that something is encoded -- otherwise the decoder is decoration.
+$b64line = ($OutEv -split "`r?`n" | Where-Object { $_ -match 'behaves like the malware' } |
+            Where-Object { $_ -match 'runs downloaded text as code|downloads a file using .NET' })
+Check ([bool]$b64line) 'base64 payload is decoded and scored, not just noticed'
+
+$OutBn = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
+            -ScanRoot $BnRoot -Indicators $RealIoc -NoColor -Deep 2>&1 | Out-String
+$RcBn = $LASTEXITCODE
+$BnHits = ([regex]::Matches($OutBn, 'behaves like the malware')).Count
+
+Write-Host "  benign scripts flagged:    $BnHits (want 0)"
+Check ($BnHits -eq 0)                      "no false positives on ordinary scripts ($BnHits)"
+Check ($RcBn -eq 0)                        "benign corpus exits 0 (got $RcBn)"
+Check (-not ($OutBn -match 'WORTH A LOOK')) 'benign corpus raises no alarms at all'
+
+# Losing the rule file must fail loudly rather than report a clean deep scan.
+$rules = Join-Path $Repo 'behaviour-rules.tsv'
+Move-Item $rules "$Fix\rules.bak" -Force
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
+    -ScanRoot $BnRoot -Indicators $RealIoc -NoColor -Deep 2>&1 | Out-Null
+Check ($LASTEXITCODE -eq 2) "missing behaviour rules exits 2, not a false 'clean'"
+Move-Item "$Fix\rules.bak" $rules -Force
 
 # ---------------------------------------------- refuses to run without IOCs
 

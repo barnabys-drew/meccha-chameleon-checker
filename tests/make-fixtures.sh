@@ -16,6 +16,7 @@ REPO="$(dirname "$HERE")"
 FIX="$HERE/fixtures"
 SCANNER="$REPO/scan-linux.sh"
 APPID=4704690
+if python3 --version >/dev/null 2>&1; then PYTHON=python3; else PYTHON=python; fi
 
 PASS=0; FAIL=0
 ok()   { printf '  \033[1;32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1)); }
@@ -165,6 +166,10 @@ echo "$OUT_CLEAN" | grep -qF "not proof that you are clean" \
 [ "$RC_CLEAN" -eq 0 ] \
     && ok "exit code 0 when nothing found"        || bad "exit code 0 when nothing found (got $RC_CLEAN)"
 
+JSON_CLEAN="$(bash "$SCANNER" --scan-root "$CLEAN" --indicators "$REPO/indicators.json" --no-color --json 2>/dev/null)"
+printf '%s' "$JSON_CLEAN" | "$PYTHON" -c 'import json,sys; d=json.load(sys.stdin); assert d["result"] == "clean"; assert d["exit_code"] == 0; assert isinstance(d["findings"], list)' \
+    && ok "--json emits a parseable clean result" || bad "--json emits a parseable clean result"
+
 # --------------------------------------------- refuses to run without IOCs
 
 echo
@@ -175,6 +180,10 @@ bash "$SCANNER" --scan-root "$CLEAN" --indicators "$FIX/bad.json" --no-color >/d
 [ $? -eq 2 ] \
     && ok "exits 2 rather than reporting a false 'clean'" \
     || bad "exits 2 rather than reporting a false 'clean'"
+
+JSON_ERROR="$(bash "$SCANNER" --scan-root "$CLEAN" --indicators "$FIX/bad.json" --no-color --json 2>/dev/null)"
+printf '%s' "$JSON_ERROR" | "$PYTHON" -c 'import json,sys; d=json.load(sys.stdin); assert d["result"] == "error"; assert d["exit_code"] == 2' \
+    && ok "--json stays parseable on errors" || bad "--json stays parseable on errors"
 
 # --------------------------------------- repackaged variant, --deep vs not
 

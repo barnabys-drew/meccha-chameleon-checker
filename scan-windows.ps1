@@ -15,7 +15,8 @@ param(
     [string]$ScanRoot,
     [string]$Indicators,
     [switch]$NoColor,
-    [switch]$Deep
+    [switch]$Deep,
+    [Alias('Json')][switch]$JsonOutput
 )
 
 $ErrorActionPreference = 'Continue'
@@ -28,16 +29,34 @@ $script:ReportLines  = New-Object System.Collections.Generic.List[string]
 $script:FoundCount   = 0
 $script:SuspectCount = 0
 $script:NoteCount    = 0
+$script:JsonFindings = New-Object System.Collections.Generic.List[object]
+
+function Write-JsonError {
+    param([string]$Message)
+    if ($JsonOutput) {
+        [pscustomobject]@{
+            tool_version = '1.0.0'; indicators_updated = $null
+            scanned_at = (Get-Date).ToUniversalTime().ToString('o')
+            host = $env:COMPUTERNAME; platform = 'windows'; deep = [bool]$Deep
+            result = 'error'; exit_code = 2; steam_libraries = @(); maps_examined = 0
+            findings = @([pscustomobject]@{ severity = 'note'; check = 'error'; message = $Message; path = $null })
+        } | ConvertTo-Json -Depth 5 -Compress
+    } else { Write-Error $Message }
+}
 
 function Say {
     param([string]$Text, [string]$Color)
     $script:ReportLines.Add($Text)
-    if ($NoColor -or -not $Color) { Write-Host $Text }
+    if ($JsonOutput) { [Console]::Error.WriteLine($Text) }
+    elseif ($NoColor -or -not $Color) { Write-Host $Text }
     else { Write-Host $Text -ForegroundColor $Color }
 }
 
 function Add-Finding {
-    param([ValidateSet('FOUND','SUSPICIOUS')][string]$Severity, [string]$What, [string]$Where)
+    param([ValidateSet('FOUND','SUSPICIOUS')][string]$Severity, [string]$What, [string]$Where, [string]$Check = 'indicator')
+    $script:JsonFindings.Add([pscustomobject]@{
+        severity = $Severity.ToLower(); check = $Check; message = $What; path = $Where
+    })
     if ($Severity -eq 'FOUND') {
         $script:FoundCount++
         Say "  [FOUND]      $What" 'Red'
@@ -53,7 +72,10 @@ function Add-Finding {
 # which an innocent file can also do. Kept separate from the Found/Suspect
 # counts so behaviour alone never reads as "you are infected".
 function Add-Note {
-    param([string]$What, [string]$Where)
+    param([string]$What, [string]$Where, [string]$Check = 'behaviour')
+    $script:JsonFindings.Add([pscustomobject]@{
+        severity = 'note'; check = $Check; message = $What; path = $Where
+    })
     $script:NoteCount++
     Say "  [WORTH A LOOK] $What" 'Cyan'
     Say "                 $Where" 'DarkGray'
@@ -73,13 +95,13 @@ function Add-Info { param([string]$Path) $script:InfoLines.Add($Path) }
 # machine, which is the single worst thing this tool could do.
 
 if (-not (Test-Path -LiteralPath $Indicators)) {
-    Write-Error "Cannot read indicators file: $Indicators"
+    Write-JsonError "Cannot read indicators file: $Indicators"
     exit 2
 }
 try {
     $ioc = Get-Content -LiteralPath $Indicators -Raw -ErrorAction Stop | ConvertFrom-Json
 } catch {
-    Write-Error "Could not parse $Indicators -- refusing to report a misleading 'clean' result."
+    Write-JsonError "Could not parse $Indicators -- refusing to report a misleading 'clean' result."
     exit 2
 }
 
@@ -90,7 +112,7 @@ $BadStrings  = @($ioc.content_strings)
 $DropNames   = @($ioc.dropped_filenames)
 
 if (-not $AppId -or $BadHashes.Count -eq 0 -or $BadStrings.Count -eq 0) {
-    Write-Error "Indicator file is missing required fields -- refusing to report a misleading 'clean' result."
+    Write-JsonError "Indicator file is missing required fields -- refusing to report a misleading 'clean' result."
     exit 2
 }
 
@@ -215,7 +237,7 @@ if ($Synthetic) {
                     Where-Object { $_.DriveType -in 2,3,4,6 } | ForEach-Object { "$($_.DeviceID)\" })
     } catch { }
     $drives = $drives | Sort-Object -Unique
-    Write-Host '  Searching all drives for Steam libraries...' -ForegroundColor DarkGray
+    Say '  Searching all drives for Steam libraries...' 'DarkGray'
 
     foreach ($dr in $drives) {
         foreach ($sub in @('SteamLibrary','Steam','Games\SteamLibrary','Games\Steam',
@@ -414,8 +436,7 @@ if ($Deep) {
         }
     }
     if ($BehavRules.Count -lt 5) {
-        Write-Error "-Deep needs behaviour-rules.tsv, which is missing or unreadable: $rulesFile"
-        Write-Error "Refusing to report 'nothing suspicious' from a scan that could not run."
+        Write-JsonError "-Deep needs behaviour-rules.tsv, which is missing or unreadable: $rulesFile"
         exit 2
     }
 
@@ -714,8 +735,21 @@ $header = @(
 )
 try {
     Set-Content -LiteralPath $reportFile -Value ($header + $script:ReportLines) -Encoding UTF8
-    Write-Host "  A copy of this report was saved to:" -ForegroundColor DarkGray
-    Write-Host "  $reportFile`n" -ForegroundColor DarkGray
+    Say '  A copy of this report was saved to:' 'DarkGray'
+    Say "  $reportFile`n" 'DarkGray'
 } catch { }
+
+if ($JsonOutput) {
+    $result = if ($exitCode -eq 1) { 'indicators_found' } elseif ($exitCode -eq 3) { 'behaviour_only' } else { 'clean' }
+    $jsonSteamRoots = @($SteamRoots | ForEach-Object { [string]$_ })
+    $jsonFindings = @($script:JsonFindings | ForEach-Object { $_ })
+    [pscustomobject]@{
+        tool_version = '1.0.0'; indicators_updated = [string]$ioc.updated
+        scanned_at = (Get-Date).ToUniversalTime().ToString('o')
+        host = $env:COMPUTERNAME; platform = 'windows'; deep = [bool]$Deep
+        result = $result; exit_code = $exitCode; steam_libraries = $jsonSteamRoots
+        maps_examined = $mapsSeen; findings = $jsonFindings
+    } | ConvertTo-Json -Depth 5 -Compress
+}
 
 exit $exitCode

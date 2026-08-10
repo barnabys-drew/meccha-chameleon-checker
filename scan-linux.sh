@@ -16,6 +16,7 @@ INDICATORS="$SCRIPT_DIR/indicators.json"
 SCAN_ROOT=""
 USE_COLOR=1
 DEEP=0
+JSON=0
 REPORT_LINES=()
 
 # ---------------------------------------------------------------- arguments
@@ -33,6 +34,7 @@ Usage: ./scan-linux.sh [options]
                      (used by the test fixtures)
   --indicators FILE  Use an alternative indicators file
   --no-color         Disable coloured output
+  --json             Emit one machine-readable result on stdout
   -h, --help         Show this help
 
 This tool only reports. It never changes anything on your computer.
@@ -45,6 +47,7 @@ while [ $# -gt 0 ]; do
         --scan-root)   SCAN_ROOT="${2:-}"; shift 2 ;;
         --indicators)  INDICATORS="${2:-}"; shift 2 ;;
         --no-color)    USE_COLOR=0; shift ;;
+        --json)        JSON=1; USE_COLOR=0; shift ;;
         -h|--help)     usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -60,7 +63,30 @@ else
 fi
 
 # Print to the screen and capture for the report file.
-say() { printf '%s\n' "$1"; REPORT_LINES+=("$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"); }
+say() {
+    if [ "$JSON" = 1 ]; then printf '%s\n' "$1" >&2; else printf '%s\n' "$1"; fi
+    REPORT_LINES+=("$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')")
+}
+
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+emit_json_error() {
+    local message="$1"
+    printf '{"tool_version":"1.0.0","indicators_updated":null,"scanned_at":"%s","host":"%s","platform":"linux","deep":%s,"result":"error","exit_code":2,"steam_libraries":[],"maps_examined":0,"findings":[{"severity":"note","check":"error","message":"%s","path":null}]}\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(json_escape "$(hostname 2>/dev/null)")" \
+        "$([ "$DEEP" = 1 ] && echo true || echo false)" "$(json_escape "$message")"
+}
+
+fatal() {
+    local message="$1"
+    if [ "$JSON" = 1 ]; then emit_json_error "$message"; else printf 'ERROR: %s\n' "$message" >&2; fi
+    exit 2
+}
 
 # ------------------------------------------------------------- indicator load
 #
@@ -71,8 +97,7 @@ say() { printf '%s\n' "$1"; REPORT_LINES+=("$(printf '%s' "$1" | sed 's/\x1b\[[0
 # worst thing this tool could do.
 
 if [ ! -r "$INDICATORS" ]; then
-    echo "ERROR: cannot read indicators file: $INDICATORS" >&2
-    exit 2
+    fatal "cannot read indicators file: $INDICATORS"
 fi
 
 APPID=$(grep -oE '"steam_appid"[[:space:]]*:[[:space:]]*"[0-9]+"' "$INDICATORS" \
@@ -106,9 +131,7 @@ mapfile -t BAD_STRINGS < <(extract_array content_strings)
 mapfile -t DROP_NAMES  < <(extract_array dropped_filenames)
 
 if [ -z "$APPID" ] || [ "${#BAD_HASHES[@]}" -eq 0 ] || [ "${#BAD_STRINGS[@]}" -eq 0 ]; then
-    echo "ERROR: could not parse indicators from $INDICATORS -- refusing to report a" >&2
-    echo "       misleading 'clean' result. The file may be corrupt." >&2
-    exit 2
+    fatal "could not parse indicators from $INDICATORS -- refusing to report a misleading 'clean' result"
 fi
 
 # Undocumented, for the test suite: prove exactly what was parsed. Indicator
@@ -128,6 +151,10 @@ fi
 FOUND_COUNT=0
 SUSPECT_COUNT=0
 NOTE_COUNT=0
+JSON_SEVERITIES=()
+JSON_CHECKS=()
+JSON_MESSAGES=()
+JSON_PATHS=()
 
 # A third tier, used only by --deep. These are behaviour patterns, not known
 # indicators: they describe something that LOOKS like how this malware works,
@@ -135,6 +162,8 @@ NOTE_COUNT=0
 # counts so behaviour alone never reads as "you are infected".
 note() {  # note <what> <where>
     NOTE_COUNT=$((NOTE_COUNT + 1))
+    JSON_SEVERITIES+=("note"); JSON_CHECKS+=("${3:-behaviour}")
+    JSON_MESSAGES+=("$1"); JSON_PATHS+=("$2")
     say "  ${C_CYA}[WORTH A LOOK]${C_OFF} $1"
     say "                 ${C_DIM}$2${C_OFF}"
 }
@@ -147,7 +176,9 @@ INFO_LINES=()
 info() { INFO_LINES+=("$1"); }
 
 finding() {  # finding <FOUND|SUSPICIOUS> <what> <where>
-    local sev="$1" what="$2" where="$3"
+    local sev="$1" what="$2" where="$3" check="${4:-indicator}"
+    JSON_SEVERITIES+=("$(printf '%s' "$sev" | tr 'A-Z' 'a-z')")
+    JSON_CHECKS+=("$check"); JSON_MESSAGES+=("$what"); JSON_PATHS+=("$where")
     if [ "$sev" = "FOUND" ]; then
         FOUND_COUNT=$((FOUND_COUNT + 1))
         say "  ${C_RED}[FOUND]${C_OFF}      $what"
@@ -170,7 +201,8 @@ contains_string() {
 say ""
 say "${C_BLD}  Meccha Chameleon Workshop malware checker${C_OFF}"
 say "  ${C_DIM}Read-only. This tool changes nothing on your computer.${C_OFF}"
-say "  ${C_DIM}Indicators updated: $(grep -oE '"updated"[^,]*' "$INDICATORS" | grep -oE '[0-9-]{10}')${C_OFF}"
+INDICATORS_UPDATED=$(grep -oE '"updated"[^,]*' "$INDICATORS" | grep -oE '[0-9-]{10}')
+say "  ${C_DIM}Indicators updated: $INDICATORS_UPDATED${C_OFF}"
 say ""
 
 # ------------------------------------------------------- locate steam / homes
@@ -221,7 +253,7 @@ else
     done
     mapfile -t MOUNTS < <(printf '%s\n' "${MOUNTS[@]}" | awk 'NF && !seen[$0]++')
 
-    printf '  Searching all drives for Steam libraries...\n'
+    say '  Searching all drives for Steam libraries...'
     for mp in "${MOUNTS[@]}"; do
         [ -d "$mp" ] || continue
         # Common library folder names sitting directly on a drive.
@@ -419,11 +451,7 @@ if [ "$DEEP" = 1 ]; then
         BEHAV_RULE_COUNT=$(grep -cvE '^[[:space:]]*(#|$)' "$BEHAV_RULES_FILE" 2>/dev/null || echo 0)
     fi
     if [ "$BEHAV_RULE_COUNT" -lt 5 ]; then
-        echo "ERROR: --deep needs behaviour-rules.tsv, which is missing or unreadable:" >&2
-        echo "       $BEHAV_RULES_FILE" >&2
-        echo "       Re-download the tool and keep all files together in one folder." >&2
-        echo "       Refusing to report 'nothing suspicious' from a scan that could not run." >&2
-        exit 2
+        fatal "--deep needs behaviour-rules.tsv, which is missing or unreadable: $BEHAV_RULES_FILE"
     fi
 
     # Files worth analysing, and files merely worth noticing by location.
@@ -718,6 +746,22 @@ REPORT_FILE="$REPORT_DIR/meccha-check-report-$(date +%Y%m%d-%H%M%S).txt"
     printf 'Result: %s\n\n' "$([ "$EXIT" = 0 ] && echo 'no known indicators found' || echo 'INDICATORS FOUND')"
     printf '%s\n' "${REPORT_LINES[@]}"
 } >"$REPORT_FILE" 2>/dev/null \
-    && printf '  %sA copy of this report was saved to:%s\n  %s\n\n' "$C_DIM" "$C_OFF" "$REPORT_FILE"
+    && { say "  ${C_DIM}A copy of this report was saved to:${C_OFF}"; say "  $REPORT_FILE"; say ""; }
+
+if [ "$JSON" = 1 ]; then
+    case "$EXIT" in 1) RESULT=indicators_found;; 3) RESULT=behaviour_only;; *) RESULT=clean;; esac
+    printf '{"tool_version":"1.0.0","indicators_updated":"%s","scanned_at":"%s","host":"%s","platform":"linux","deep":%s,"result":"%s","exit_code":%s,"steam_libraries":[' \
+        "$(json_escape "$INDICATORS_UPDATED")" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "$(json_escape "$(hostname 2>/dev/null)")" "$([ "$DEEP" = 1 ] && echo true || echo false)" "$RESULT" "$EXIT"
+    for i in "${!STEAM_ROOTS[@]}"; do [ "$i" = 0 ] || printf ','; printf '"%s"' "$(json_escape "${STEAM_ROOTS[$i]}")"; done
+    printf '],"maps_examined":%s,"findings":[' "$WORKSHOP_DIRS_SEEN"
+    for i in "${!JSON_MESSAGES[@]}"; do
+        [ "$i" = 0 ] || printf ','
+        printf '{"severity":"%s","check":"%s","message":"%s","path":"%s"}' \
+            "$(json_escape "${JSON_SEVERITIES[$i]}")" "$(json_escape "${JSON_CHECKS[$i]}")" \
+            "$(json_escape "${JSON_MESSAGES[$i]}")" "$(json_escape "${JSON_PATHS[$i]}")"
+    done
+    printf ']}\n'
+fi
 
 exit "$EXIT"

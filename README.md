@@ -239,6 +239,15 @@ statements only — and marker strings are assembled from fragments at runtime.
 | `2` | The scan could not run |
 | `3` | Deep scan only — behaviour worth a look, no known indicators |
 
+For fleet or lab automation, add `--json` on Linux or `-Json` on Windows. The
+scanner writes one stable JSON object to stdout while keeping the normal human
+report on stderr:
+
+```bash
+./scan-linux.sh --json > result.json
+powershell -File .\scan-windows.ps1 -Json > result.json
+```
+
 ### Detection coverage, honestly
 
 The IOC checks sit at the bottom of the Pyramid of Pain — a hash, an IP, a map ID — all trivially

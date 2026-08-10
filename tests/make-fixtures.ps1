@@ -158,6 +158,12 @@ Check ($OutClean -match 'No known indicators of this malware were found') 'repor
 Check ($OutClean -match 'not proof that you are clean')                   "keeps the 'not proof you are clean' caveat"
 Check ($RcClean -eq 0)                                                    "exit code 0 when nothing found (got $RcClean)"
 
+$JsonClean = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
+                 -ScanRoot $Clean -Indicators (Join-Path $Repo 'indicators.json') -NoColor -Json 2>$null | Out-String
+try { $JsonCleanResult = $JsonClean | ConvertFrom-Json } catch { $JsonCleanResult = $null }
+Check ($null -ne $JsonCleanResult -and $JsonCleanResult.result -eq 'clean' -and $JsonCleanResult.exit_code -eq 0) `
+      '-Json emits a parseable clean result'
+
 # --------------------------------------- repackaged variant, -Deep vs not
 
 Write-Host ''

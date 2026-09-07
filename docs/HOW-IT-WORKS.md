@@ -127,7 +127,7 @@ caret use or a long base64 blob contributes to the total on its own.
 The loose-file check reports on a single signal rather than requiring two, because the capability
 half of that chain is one `LaunchURL` node and the capability check above needs two matches to fire.
 The file type carries the weight instead: a Meccha Workshop item is scenery, and scenery has no
-reason to ship a Windows executable or script. **Linux only at present** — see the gap list below.
+reason to ship a Windows executable or script.
 
 Analysed extensions: `.bat .cmd .ps1 .psm1 .vbs .vbe .js .jse .wsf .hta`. Depth 3, because a dropper
 can just as easily write into a subfolder.
@@ -239,15 +239,6 @@ difficulty ratings are rough.
 persists as, or what it steals. Every check here targets the **dropper**. If you have a sample, or
 sandbox telemetry from one, that is by far the most valuable thing you could contribute — it's the
 reason the tool refuses to tell anyone they're clean.
-
-### 1b. The loose-file check is Linux-only — *easy, and it breaks a rule this repo cares about*
-
-The `--deep` check for a runnable file sitting loose in a Workshop map directory exists in
-`scan-linux.sh` but **not** in `scan-windows.ps1`, so the two scanners currently disagree. This is a
-deliberate, temporary asymmetry: it was added in an environment with no PowerShell available to run
-`tests/make-fixtures.ps1`, and shipping an untested check into the Windows scanner — the one most
-affected players actually run — was the worse of the two options. Porting it is a small, well-defined
-job for anyone who can run the Windows fixtures.
 
 ### 2. No real `.pak` parsing — *hard, highest technical value*
 

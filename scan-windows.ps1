@@ -554,6 +554,42 @@ if ($Deep) {
         }
     }
 
+    # -- B3b: a runnable file sitting loose inside a Workshop map -----------
+    # Checks 3 and 4 only ever open .pak/.utoc/.ucas, so anything else in a map
+    # directory is invisible to this tool. That is a real delivery path, not a
+    # hypothetical one: Steam accepts any file type in a Workshop item, the
+    # install directory is at a path the author knows in advance, and a
+    # Blueprint's LaunchURL node reaches ShellExecuteW, which will "open" -- run
+    # -- a local file given a file:// URL. The payload never has to be inside
+    # the Unreal containers at all.
+    #
+    # Reported on its own rather than needing a second signal, because the
+    # capability half of that chain is a single LaunchURL node and B3 above
+    # needs two matches to fire. A Meccha Workshop item is scenery; it has no
+    # reason to ship a Windows executable or script, so the file type alone is
+    # the signal.
+    #
+    # Deliberately narrow: only unambiguously runnable Windows types. Maps do
+    # legitimately ship .txt, .png, .json and stray editor leftovers, and none
+    # of those belong here.
+    $looseRunnable = '^\.(bat|cmd|exe|ps1|vbs|vbe|js|jse|wsf|hta|scr|pif|com|msi|lnk)$'
+    foreach ($root in $SteamRoots) {
+        $content = Join-Path $root "steamapps\workshop\content\$AppId"
+        if (-not (Test-Path -LiteralPath $content)) { continue }
+        $loose = Get-ChildItem -LiteralPath $content -Recurse -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Extension -match $looseRunnable }
+        foreach ($lf in $loose) {
+            if ($behavSeen.ContainsKey($lf.FullName)) { continue }
+            $behavSeen[$lf.FullName] = $true
+            $r = Test-FileBehaviour -Path $lf.FullName
+            if ($r) {
+                Add-Note "A Workshop map contains a program that behaves like the malware: $($r.Why)" $lf.FullName
+            } else {
+                Add-Note "A Workshop map contains a program file, which a map does not need" $lf.FullName
+            }
+        }
+    }
+
     # -- B4: evidence that something already ran ----------------------------
     # The only checks that can still find anything after the files themselves
     # have been deleted.

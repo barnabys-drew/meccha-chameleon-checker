@@ -95,6 +95,14 @@ New-Item -ItemType Directory -Path "$Clean\home\Documents" -Force | Out-Null
 New-Item -ItemType Directory -Path "$Clean\home\Startup"   -Force | Out-Null
 Set-Content -LiteralPath "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222\nice.pak" `
             -Value 'a completely normal community map'
+# Ordinary extras a map author really does ship alongside the containers.
+# None of these are runnable, so B3b must stay silent on all of them.
+Set-Content -LiteralPath "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222\readme.txt" `
+            -Value 'Made by a real person. Enjoy!'
+Set-Content -LiteralPath "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222\preview.png" `
+            -Value 'PNG placeholder'
+Set-Content -LiteralPath "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222\mapinfo.json" `
+            -Value '{"name":"Nice Map","version":2}'
 
 # -------------------------------------------------------------- variant tree
 #
@@ -123,6 +131,28 @@ $vbytes = [byte[]]@() `
     + [System.Text.Encoding]::Unicode.GetBytes('GetPlatformUserDir') `
     + [System.Text.Encoding]::ASCII.GetBytes('SaveStringToFilePADDING')
 [System.IO.File]::WriteAllBytes("$VWs\newmap.pak", $vbytes)
+
+# A second variant map using the LaunchURL delivery path instead: the payload
+# is a loose batch file sitting in the Workshop item directory, and the map
+# only needs a single LaunchURL node to run it via file://. Checks 3 and 4 open
+# nothing but .pak/.utoc/.ucas, and B3 needs two capability strings, so before
+# B3b neither half of this chain was visible to the scanner.
+$VWs2 = Join-Path $Var "steamroot\steamapps\workshop\content\$AppId\4343434343"
+New-Item -ItemType Directory -Path $VWs2 -Force | Out-Null
+$v2bytes = [byte[]]@() `
+    + [System.Text.Encoding]::ASCII.GetBytes('PAKFILEHEADER') `
+    + [System.Text.Encoding]::Unicode.GetBytes('LaunchURL') `
+    + [System.Text.Encoding]::ASCII.GetBytes('PADDING')
+[System.IO.File]::WriteAllBytes("$VWs2\arena.pak", $v2bytes)
+Set-Content -LiteralPath "$VWs2\payload.bat" -Value @(
+    '@echo off',
+    'echo inert test fixture'
+)
+
+# Files a real map legitimately ships, in the same directory, to prove B3b
+# keys on runnable types rather than on "anything that is not a container".
+Set-Content -LiteralPath "$VWs2\readme.txt"  -Value 'Thanks for subscribing to my map!'
+Set-Content -LiteralPath "$VWs2\preview.png" -Value 'PNG placeholder'
 
 # ------------------------------------------------------------------ run them
 
@@ -178,6 +208,9 @@ Check ($OutVarIoc -match 'No known indicators of this malware were found') 'IOC-
 Check ($RcVarIoc -eq 0)                                                    "IOC-only exits 0 on the variant (got $RcVarIoc)"
 Check ($OutVarDeep -match 'behaves like the malware')                     '-Deep catches the dropper pattern'
 Check ($OutVarDeep -match 'launch programs, which maps do not need')       '-Deep catches Unreal capability abuse'
+Check ($OutVarDeep -match 'contains a program file, which a map does not need') '-Deep catches a loose payload inside a Workshop map'
+Check ($OutVarDeep -match 'payload\.bat')                                  '-Deep names the loose payload file'
+Check (-not ($OutVarDeep -match 'readme\.txt|preview\.png'))               'loose-file check ignores non-runnable map extras'
 Check ($OutVarDeep -match 'worth a look')                                  '-Deep wording avoids claiming infection'
 Check ($OutVarDeep -match 'Do not panic')                                  '-Deep tells the user most hits are false alarms'
 Check ($RcVarDeep -eq 3)                                                   "-Deep exits 3 for behaviour-only hits (got $RcVarDeep)"

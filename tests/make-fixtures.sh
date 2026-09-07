@@ -89,6 +89,14 @@ mkdir -p "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222"
 mkdir -p "$CLEAN/home/Documents" "$CLEAN/home/.config/autostart"
 printf 'a completely normal community map\n' \
     > "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222/nice.pak"
+# Ordinary extras a map author really does ship alongside the containers.
+# None of these are runnable, so B3b must stay silent on all of them.
+printf 'Made by a real person. Enjoy!\n' \
+    > "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222/readme.txt"
+printf 'PNG placeholder\n' \
+    > "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222/preview.png"
+printf '{"name":"Nice Map","version":2}\n' \
+    > "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222/mapinfo.json"
 
 # ------------------------------------------------------------- variant tree
 #
@@ -115,6 +123,28 @@ mkdir -p "$VWS" "$VAR/home/Documents" "$VAR/home/.config/autostart"
     printf 'GetPlatformUserDir'
     printf '\x00\x00SaveStringToFile\x00\x00PADDING'
 } > "$VWS/newmap.pak"
+
+# A second variant map using the LaunchURL delivery path instead: the payload
+# is a loose batch file sitting in the Workshop item directory, and the map
+# only needs a single LaunchURL node to run it via file://. Checks 3 and 4 open
+# nothing but .pak/.utoc/.ucas, and B3 needs two capability strings, so before
+# B3b neither half of this chain was visible to the scanner.
+VWS2="$VAR/steamroot/steamapps/workshop/content/$APPID/4343434343"
+mkdir -p "$VWS2"
+{
+    printf 'PAKFILEHEADER\x00\x00'
+    printf 'LaunchURL'
+    printf '\x00\x00PADDING'
+} > "$VWS2/arena.pak"
+{
+    printf '@echo off\r\n'
+    printf 'echo inert test fixture\r\n'
+} > "$VWS2/payload.bat"
+
+# Files a real map legitimately ships, in the same directory, to prove B3b
+# keys on runnable types rather than on "anything that is not a container".
+printf 'Thanks for subscribing to my map!\n' > "$VWS2/readme.txt"
+printf 'PNG placeholder\n'                   > "$VWS2/preview.png"
 
 # ------------------------------------------------------------------ run them
 
@@ -199,6 +229,14 @@ echo "$OUT_VAR_DEEP" | grep -qF "behaves like the malware" \
     && ok "--deep catches the dropper pattern"    || bad "--deep catches the dropper pattern"
 echo "$OUT_VAR_DEEP" | grep -qF "launch programs, which maps do not need" \
     && ok "--deep catches Unreal capability abuse" || bad "--deep catches Unreal capability abuse"
+echo "$OUT_VAR_DEEP" | grep -qF "contains a program file, which a map does not need" \
+    && ok "--deep catches a loose payload inside a Workshop map" \
+    || bad "--deep catches a loose payload inside a Workshop map"
+echo "$OUT_VAR_DEEP" | grep -qF "payload.bat" \
+    && ok "--deep names the loose payload file"   || bad "--deep names the loose payload file"
+echo "$OUT_VAR_DEEP" | grep -qE "readme\.txt|preview\.png" \
+    && bad "loose-file check ignores non-runnable map extras" \
+    || ok "loose-file check ignores non-runnable map extras"
 echo "$OUT_VAR_DEEP" | grep -qF "worth a look" \
     && ok "--deep wording avoids claiming infection" \
     || bad "--deep wording avoids claiming infection"

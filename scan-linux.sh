@@ -583,6 +583,46 @@ if [ "$DEEP" = 1 ]; then
         done < <(find "$content" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
     done
 
+    # -- B3b: a runnable file sitting loose inside a Workshop map -----------
+    # Checks 3 and 4 only ever open .pak/.utoc/.ucas, so anything else in a map
+    # directory is invisible to this tool. That is a real delivery path, not a
+    # hypothetical one: Steam accepts any file type in a Workshop item, the
+    # install directory is at a path the author knows in advance, and a
+    # Blueprint's LaunchURL node reaches ShellExecuteW, which will "open" -- run
+    # -- a local file given a file:// URL. The payload never has to be inside
+    # the Unreal containers at all.
+    #
+    # Reported on its own rather than needing a second signal, because the
+    # capability half of that chain is a single LaunchURL node and B3 needs two
+    # matches to fire. A Meccha Workshop item is scenery; it has no reason to
+    # ship a Windows executable or script, so the file type alone is the signal.
+    #
+    # Deliberately narrow: only unambiguously runnable Windows types. Maps do
+    # legitimately ship .txt, .png, .json and stray editor leftovers, and none
+    # of those belong here.
+    # -iname alternation rather than -iregex: GNU find defaults to an Emacs
+    # regex dialect where ( and | are literal characters, so an extended-regex
+    # pattern here would silently match nothing.
+    for root in "${STEAM_ROOTS[@]:-}"; do
+        content="$root/steamapps/workshop/content/$APPID"
+        [ -d "$content" ] || continue
+        while IFS= read -r -d '' lf; do
+            [ -n "${BEHAV_SEEN[$lf]:-}" ] && continue
+            BEHAV_SEEN[$lf]=1
+            if behav_analyse_file "$lf"; then
+                note "A Workshop map contains a program that behaves like the malware: $B_WHY" "$lf"
+            else
+                note "A Workshop map contains a program file, which a map does not need" "$lf"
+            fi
+        done < <(find "$content" -type f \( \
+                    -iname '*.bat' -o -iname '*.cmd' -o -iname '*.exe' -o \
+                    -iname '*.ps1' -o -iname '*.vbs' -o -iname '*.vbe' -o \
+                    -iname '*.js'  -o -iname '*.jse' -o -iname '*.wsf' -o \
+                    -iname '*.hta' -o -iname '*.scr' -o -iname '*.pif' -o \
+                    -iname '*.com' -o -iname '*.msi' -o -iname '*.lnk' \
+                 \) -print0 2>/dev/null)
+    done
+
     # -- B4: evidence that something already ran ----------------------------
     # The only checks here that can still find anything after the files have
     # been deleted. On Linux the game runs under Proton, so the Windows-side

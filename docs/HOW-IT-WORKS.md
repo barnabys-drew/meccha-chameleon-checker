@@ -114,14 +114,20 @@ caret use or a long base64 blob contributes to the total on its own.
 > lowercased copy used for matching decodes to nothing — which looks exactly like "this file was not
 > obfuscated". This was a real bug during development.
 
-#### The four checks
+#### The five checks
 
 | Check | Catches | False-positive control |
 |---|---|---|
 | Scripts in Documents (depth 3) scored against the rule table | Recompiled droppers with new infrastructure | Score + category thresholds |
 | Program-type files merely *located* in Documents | The drop location itself | Reported as **context only** — does not count toward the verdict or exit code |
 | Workshop pak referencing file-write / process-launch capability | Unreported malicious maps | Requires **two distinct** capabilities, not one |
+| Runnable file sitting loose in a Workshop map directory | The `LaunchURL` delivery path, where the payload never enters the containers | Restricted to unambiguously runnable Windows types; `.txt`, `.png`, `.json` and other ordinary map extras are ignored |
 | Prefetch, Defender history, PowerShell 4104, Wine prefix registry | Infection whose files were deleted | Narrowly scoped; needs admin for Prefetch |
+
+The loose-file check reports on a single signal rather than requiring two, because the capability
+half of that chain is one `LaunchURL` node and the capability check above needs two matches to fire.
+The file type carries the weight instead: a Meccha Workshop item is scenery, and scenery has no
+reason to ship a Windows executable or script.
 
 Analysed extensions: `.bat .cmd .ps1 .psm1 .vbs .vbe .js .jse .wsf .hta`. Depth 3, because a dropper
 can just as easily write into a subfolder.

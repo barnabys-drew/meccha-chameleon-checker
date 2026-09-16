@@ -16,6 +16,7 @@ INDICATORS="$SCRIPT_DIR/indicators.json"
 SCAN_ROOT=""
 USE_COLOR=1
 DEEP=0
+JSON=0
 REPORT_LINES=()
 
 # ---------------------------------------------------------------- arguments
@@ -32,6 +33,9 @@ Usage: ./scan-linux.sh [options]
   --scan-root DIR    Scan DIR as a synthetic root instead of the real system
                      (used by the test fixtures)
   --indicators FILE  Use an alternative indicators file
+  --json             Print one machine-readable JSON result on stdout, for
+                     checking many computers at once. The normal report
+                     still appears, on stderr.
   --no-color         Disable coloured output
   -h, --help         Show this help
 
@@ -44,13 +48,40 @@ while [ $# -gt 0 ]; do
         --deep)        DEEP=1; shift ;;
         --scan-root)   SCAN_ROOT="${2:-}"; shift 2 ;;
         --indicators)  INDICATORS="${2:-}"; shift 2 ;;
+        --json)        JSON=1; shift ;;
         --no-color)    USE_COLOR=0; shift ;;
         -h|--help)     usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ]; then USE_COLOR=0; fi
+# Everything a person reads goes to fd 3. Normally that is stdout; with --json
+# it is stderr, so stdout carries exactly one JSON document and nothing else --
+# a stray progress line would make every result unparseable.
+if [ "$JSON" = 1 ]; then exec 3>&2; else exec 3>&1; fi
+
+# A JSON string literal. Paths are the only untrusted text here, and a
+# filename can legally contain quotes, backslashes and control characters.
+json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')"
+}
+
+# Exit 2 -- the scan could not run. Under --json this still prints a result, so
+# a sweep of many machines records "failed" rather than silently skipping one.
+abort() {  # abort <line>...
+    local l
+    for l in "$@"; do printf '%s\n' "$l" >&2; done
+    if [ "$JSON" = 1 ]; then
+        printf '{"schema":1,"tool":"meccha-chameleon-checker","platform":"linux","host":%s,"exit_code":2,"verdict":"scan_failed","error":%s}\n' \
+            "$(json_str "$(uname -n 2>/dev/null)")" "$(json_str "$1")"
+    fi
+    exit 2
+}
+
+if [ ! -t 3 ] || [ -n "${NO_COLOR:-}" ]; then USE_COLOR=0; fi
 if [ "$USE_COLOR" = 1 ]; then
     C_RED=$'\033[1;31m'; C_YEL=$'\033[1;33m'; C_GRN=$'\033[1;32m'
     C_CYA=$'\033[1;36m'
@@ -60,7 +91,7 @@ else
 fi
 
 # Print to the screen and capture for the report file.
-say() { printf '%s\n' "$1"; REPORT_LINES+=("$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"); }
+say() { printf '%s\n' "$1" >&3; REPORT_LINES+=("$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"); }
 
 # ------------------------------------------------------------- indicator load
 #
@@ -71,8 +102,7 @@ say() { printf '%s\n' "$1"; REPORT_LINES+=("$(printf '%s' "$1" | sed 's/\x1b\[[0
 # worst thing this tool could do.
 
 if [ ! -r "$INDICATORS" ]; then
-    echo "ERROR: cannot read indicators file: $INDICATORS" >&2
-    exit 2
+    abort "ERROR: cannot read indicators file: $INDICATORS"
 fi
 
 APPID=$(grep -oE '"steam_appid"[[:space:]]*:[[:space:]]*"[0-9]+"' "$INDICATORS" \
@@ -106,9 +136,8 @@ mapfile -t BAD_STRINGS < <(extract_array content_strings)
 mapfile -t DROP_NAMES  < <(extract_array dropped_filenames)
 
 if [ -z "$APPID" ] || [ "${#BAD_HASHES[@]}" -eq 0 ] || [ "${#BAD_STRINGS[@]}" -eq 0 ]; then
-    echo "ERROR: could not parse indicators from $INDICATORS -- refusing to report a" >&2
-    echo "       misleading 'clean' result. The file may be corrupt." >&2
-    exit 2
+    abort "ERROR: could not parse indicators from $INDICATORS -- refusing to report a" \
+          "       misleading 'clean' result. The file may be corrupt."
 fi
 
 # Undocumented, for the test suite: prove exactly what was parsed. Indicator
@@ -128,6 +157,11 @@ fi
 FOUND_COUNT=0
 SUSPECT_COUNT=0
 NOTE_COUNT=0
+FINDINGS_JSON=()   # one JSON object per finding, in report order, for --json
+
+record() {  # record <severity> <what> <where>
+    FINDINGS_JSON+=("{\"severity\":\"$1\",\"what\":$(json_str "$2"),\"where\":$(json_str "$3")}")
+}
 
 # A third tier, used only by --deep. These are behaviour patterns, not known
 # indicators: they describe something that LOOKS like how this malware works,
@@ -135,6 +169,7 @@ NOTE_COUNT=0
 # counts so behaviour alone never reads as "you are infected".
 note() {  # note <what> <where>
     NOTE_COUNT=$((NOTE_COUNT + 1))
+    record WORTH_A_LOOK "$1" "$2"
     say "  ${C_CYA}[WORTH A LOOK]${C_OFF} $1"
     say "                 ${C_DIM}$2${C_OFF}"
 }
@@ -148,6 +183,7 @@ info() { INFO_LINES+=("$1"); }
 
 finding() {  # finding <FOUND|SUSPICIOUS> <what> <where>
     local sev="$1" what="$2" where="$3"
+    record "$sev" "$what" "$where"
     if [ "$sev" = "FOUND" ]; then
         FOUND_COUNT=$((FOUND_COUNT + 1))
         say "  ${C_RED}[FOUND]${C_OFF}      $what"
@@ -223,7 +259,7 @@ else
     done
     mapfile -t MOUNTS < <(printf '%s\n' "${MOUNTS[@]}" | awk 'NF && !seen[$0]++')
 
-    printf '  Searching all drives for Steam libraries...\n'
+    printf '  Searching all drives for Steam libraries...\n' >&3
     for mp in "${MOUNTS[@]}"; do
         [ -d "$mp" ] || continue
         # Common library folder names sitting directly on a drive.
@@ -461,11 +497,10 @@ if [ "$DEEP" = 1 ]; then
         BEHAV_RULE_COUNT=$(grep -cvE '^[[:space:]]*(#|$)' "$BEHAV_RULES_FILE" 2>/dev/null || echo 0)
     fi
     if [ "$BEHAV_RULE_COUNT" -lt 5 ]; then
-        echo "ERROR: --deep needs behaviour-rules.tsv, which is missing or unreadable:" >&2
-        echo "       $BEHAV_RULES_FILE" >&2
-        echo "       Re-download the tool and keep all files together in one folder." >&2
-        echo "       Refusing to report 'nothing suspicious' from a scan that could not run." >&2
-        exit 2
+        abort "ERROR: --deep needs behaviour-rules.tsv, which is missing or unreadable:" \
+              "       $BEHAV_RULES_FILE" \
+              "       Re-download the tool and keep all files together in one folder." \
+              "       Refusing to report 'nothing suspicious' from a scan that could not run."
     fi
 
     # Files worth analysing, and files merely worth noticing by location.
@@ -684,8 +719,13 @@ say "  ${C_DIM}--------------------------------------------------------------${C
 say ""
 
 EXIT=0
+VERDICT="no_known_indicators"; RESULT_TEXT="no known indicators found"
+# Carried in --json output on every verdict, so a fleet dashboard that shows
+# only the verdict still cannot present "no findings" as "clean".
+CAVEAT="No known indicators is not proof a system is clean. The second stage of this attack was never captured, so what it leaves behind is unknown."
 if [ "$FOUND_COUNT" -gt 0 ] || [ "$SUSPECT_COUNT" -gt 0 ]; then
     EXIT=1
+    VERDICT="indicators_found"; RESULT_TEXT="INDICATORS FOUND"
     say "  ${C_RED}${C_BLD}Something was found. Please read this carefully.${C_OFF}"
     say ""
     say "  Confirmed indicators: $FOUND_COUNT      Suspicious: $SUSPECT_COUNT"
@@ -708,6 +748,7 @@ if [ "$FOUND_COUNT" -gt 0 ] || [ "$SUSPECT_COUNT" -gt 0 ]; then
     say ""
 elif [ "$NOTE_COUNT" -gt 0 ]; then
     EXIT=3
+    VERDICT="worth_a_look"; RESULT_TEXT="no known indicators found; behaviour worth a look"
     say "  ${C_CYA}${C_BLD}No known malware was found, but $NOTE_COUNT thing(s) are worth a look.${C_OFF}"
     say ""
     say "  ${C_BLD}Do not panic.${C_OFF} Nothing above matches this malware. The deep scan"
@@ -756,9 +797,35 @@ REPORT_FILE="$REPORT_DIR/meccha-check-report-$(date +%Y%m%d-%H%M%S).txt"
     printf 'Meccha Chameleon Workshop malware checker\n'
     printf 'Scan date: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
     printf 'Host: %s\n' "$(uname -sr 2>/dev/null)"
-    printf 'Result: %s\n\n' "$([ "$EXIT" = 0 ] && echo 'no known indicators found' || echo 'INDICATORS FOUND')"
+    printf 'Result: %s\n\n' "$RESULT_TEXT"
     printf '%s\n' "${REPORT_LINES[@]}"
 } >"$REPORT_FILE" 2>/dev/null \
-    && printf '  %sA copy of this report was saved to:%s\n  %s\n\n' "$C_DIM" "$C_OFF" "$REPORT_FILE"
+    && printf '  %sA copy of this report was saved to:%s\n  %s\n\n' "$C_DIM" "$C_OFF" "$REPORT_FILE" >&3 \
+    || REPORT_FILE=""
+
+# ------------------------------------------------------------ --json result
+#
+# The schema is documented in docs/HOW-IT-WORKS.md and is a promise: fleet
+# scripts parse it. Add fields freely; renaming or removing one means bumping
+# "schema".
+
+if [ "$JSON" = 1 ]; then
+    join_json() { local IFS=,; printf '%s' "$*"; }
+    libs=(); for r in "${STEAM_ROOTS[@]:-}"; do [ -n "$r" ] && libs+=("$(json_str "$r")"); done
+    ctx=();  for c in "${INFO_LINES[@]:-}";  do [ -n "$c" ] && ctx+=("$(json_str "$c")"); done
+    printf '{"schema":1,"tool":"meccha-chameleon-checker","platform":"linux"'
+    printf ',"host":%s'               "$(json_str "$(uname -n 2>/dev/null)")"
+    printf ',"scan_date":%s'          "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    printf ',"indicators_updated":%s' "$(json_str "$(grep -oE '"updated"[^,]*' "$INDICATORS" | grep -oE '[0-9-]{10}')")"
+    printf ',"deep":%s'               "$([ "$DEEP" = 1 ] && echo true || echo false)"
+    printf ',"exit_code":%s,"verdict":"%s"' "$EXIT" "$VERDICT"
+    printf ',"counts":{"found":%s,"suspicious":%s,"worth_a_look":%s}' \
+        "$FOUND_COUNT" "$SUSPECT_COUNT" "$NOTE_COUNT"
+    printf ',"findings":[%s]'         "$(join_json "${FINDINGS_JSON[@]:-}")"
+    printf ',"context_files":[%s]'    "$(join_json "${ctx[@]:-}")"
+    printf ',"steam_libraries":[%s]'  "$(join_json "${libs[@]:-}")"
+    printf ',"report_file":%s'        "$([ -n "$REPORT_FILE" ] && json_str "$REPORT_FILE" || echo null)"
+    printf ',"caveat":%s}\n'          "$(json_str "$CAVEAT")"
+fi
 
 exit "$EXIT"

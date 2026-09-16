@@ -69,6 +69,10 @@ MODS="$DIRTY/steamroot/steamapps/common/Test Game/TestProject/Content/Paks/~mods
 mkdir -p "$MODS"
 { printf 'LOOSE\x00'; printf '%s' "$MARK_IP" | iconv -f ASCII -t UTF-16LE; } > "$MODS/loose.pak"
 
+# A filename carrying the characters JSON must escape. It appears in --json
+# output, so a missed escape makes the whole result unparseable.
+{ printf 'ODD\x00'; printf '%s' "$MARK_IP"; } > "$MODS/odd \"quoted\" back\\slash.pak"
+
 # The dropped file, in the Proton prefix where it actually lands (check 5).
 cat > "$PFX/Documents/s.bat" <<'EOF'
 @echo off
@@ -195,6 +199,57 @@ bash "$SCANNER" --scan-root "$CLEAN" --indicators "$FIX/bad.json" --no-color >/d
 [ $? -eq 2 ] \
     && ok "exits 2 rather than reporting a false 'clean'" \
     || bad "exits 2 rather than reporting a false 'clean'"
+
+# ------------------------------------------------------- --json output
+#
+# Fleet scripts parse this, so the contract is: stdout is exactly one valid
+# JSON document, human text never leaks into it, and a scan that could not
+# run still says so in JSON rather than printing nothing.
+
+echo
+echo "  Machine-readable output (--json)"
+echo "  --------------------------------"
+
+if command -v python3 >/dev/null 2>&1; then
+    # json_field <json> <python expression over d>
+    json_field() { printf '%s' "$1" | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>/dev/null; }
+
+    J_DIRTY="$(bash "$SCANNER" --json --scan-root "$DIRTY" --indicators "$TEST_IOC" 2>"$FIX/json.err")"
+    RC_J=$?
+    [ "$(json_field "$J_DIRTY" 'd["verdict"]')" = "indicators_found" ] \
+        && ok "--json stdout parses, verdict indicators_found" \
+        || bad "--json stdout parses, verdict indicators_found"
+    [ "$(json_field "$J_DIRTY" 'd["counts"]["found"]+d["counts"]["suspicious"]==len(d["findings"])')" = "True" ] \
+        && ok "--json lists one finding per counted indicator" \
+        || bad "--json lists one finding per counted indicator"
+    [ "$(json_field "$J_DIRTY" 'any("\"quoted\" back\\slash" in f["where"] for f in d["findings"])')" = "True" ] \
+        && ok "--json escapes quotes and backslashes in paths" \
+        || bad "--json escapes quotes and backslashes in paths"
+    [ "$RC_J" -eq 1 ] && [ "$(json_field "$J_DIRTY" 'd["exit_code"]')" = "1" ] \
+        && ok "--json exit_code field matches the real exit code" \
+        || bad "--json exit_code field matches the real exit code (rc $RC_J)"
+    printf '%s' "$J_DIRTY" | grep -q 'Please read this carefully' \
+        && bad "--json keeps human text off stdout" || ok "--json keeps human text off stdout"
+    grep -q 'Please read this carefully' "$FIX/json.err" \
+        && ok "--json still shows the human report on stderr" \
+        || bad "--json still shows the human report on stderr"
+
+    J_CLEAN="$(bash "$SCANNER" --json --scan-root "$CLEAN" --indicators "$REPO/indicators.json" 2>/dev/null)"
+    [ "$(json_field "$J_CLEAN" 'd["verdict"]')" = "no_known_indicators" ] \
+        && ok "--json clean verdict is no_known_indicators, never 'clean'" \
+        || bad "--json clean verdict is no_known_indicators, never 'clean'"
+    json_field "$J_CLEAN" 'd["caveat"]' | grep -qF "not proof" \
+        && ok "--json carries the 'not proof' caveat" \
+        || bad "--json carries the 'not proof' caveat"
+
+    J_BAD="$(bash "$SCANNER" --json --scan-root "$CLEAN" --indicators "$FIX/bad.json" 2>/dev/null)"
+    RC_JB=$?
+    [ "$RC_JB" -eq 2 ] && [ "$(json_field "$J_BAD" 'd["verdict"]')" = "scan_failed" ] \
+        && ok "--json reports scan_failed with exit 2 when it cannot run" \
+        || bad "--json reports scan_failed with exit 2 when it cannot run (rc $RC_JB)"
+else
+    echo "  (python3 not found -- --json checks skipped; CI runs them)"
+fi
 
 # --------------------------------------- repackaged variant, --deep vs not
 

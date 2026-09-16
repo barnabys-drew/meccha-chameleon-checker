@@ -169,6 +169,50 @@ suspiciously".
 | `2` | Scan could not run (bad/missing indicators) |
 | `3` | `--deep` only: behaviour worth a look, no known indicators |
 
+### Machine-readable output
+
+`--json` (Linux) / `-Json` (Windows) prints **exactly one JSON document on stdout** and moves every
+human-readable line to stderr. It's for sweeping many machines. The report file is still written.
+
+```json
+{
+  "schema": 1,
+  "tool": "meccha-chameleon-checker",
+  "platform": "linux",
+  "host": "lab-pc-07",
+  "scan_date": "2026-09-16T18:00:00Z",
+  "indicators_updated": "2026-07-26",
+  "deep": false,
+  "exit_code": 1,
+  "verdict": "indicators_found",
+  "counts": { "found": 1, "suspicious": 0, "worth_a_look": 0 },
+  "findings": [
+    { "severity": "FOUND", "what": "Known malicious Workshop map is installed (ID 3765145606)",
+      "where": "/home/user/.local/share/Steam/steamapps/workshop/content/4704690/3765145606" }
+  ],
+  "context_files": [],
+  "steam_libraries": ["/home/user/.local/share/Steam"],
+  "report_file": "/home/user/meccha-chameleon-checker/meccha-check-report-20260916-180000.txt",
+  "caveat": "No known indicators is not proof a system is clean. ..."
+}
+```
+
+| Field | Values |
+|---|---|
+| `verdict` | `indicators_found` (exit 1), `worth_a_look` (exit 3), `no_known_indicators` (exit 0), `scan_failed` (exit 2) |
+| `findings[].severity` | `FOUND`, `SUSPICIOUS`, `WORTH_A_LOOK` — the same three tiers as the text report |
+| `context_files` | `--deep` only: program-type files in Documents that did **not** score. Context, never findings |
+| `report_file` | `null` if the report couldn't be written |
+
+Rules the schema keeps:
+
+- **There is no `clean` verdict.** The no-findings verdict is `no_known_indicators`, and `caveat` is
+  present on every result. That's constraint 2 again: a dashboard that shows only the verdict
+  still can't tell anyone they're safe.
+- **A scan that couldn't run still prints JSON** — `{"verdict": "scan_failed", "exit_code": 2,
+  "error": "..."}` — so a sweep records a failure instead of silently skipping a machine.
+- `schema` is bumped on any rename or removal. New fields can be added without a bump.
+
 ---
 
 ## Platform details worth knowing
@@ -297,11 +341,11 @@ by default. Not touched at all: Sysmon, ETW, `Amcache`, `ShimCache`, BAM/DAM, or
 of which could show the dropper ran after the files were deleted. Also worth adding: a short guide
 telling users how to *enable* script-block logging before they need it.
 
-### 8. No machine-readable output — *easy, good first issue*
+### 8. ~~No machine-readable output~~ — *done*
 
-There's no `--json`. An internet café, school lab or LAN-party organiser wanting to sweep 40
-machines has to read 40 terminal windows. A stable JSON schema on stdout (with the human text on
-stderr) would make fleet use practical.
+`--json` / `-Json` now exists; see [Machine-readable output](#machine-readable-output). What's still
+missing is a collector: a script that runs the scan across many machines and gathers the results.
+That's left to whatever remote-execution tool the organiser already uses.
 
 ### 9. No evidence-collection mode — *medium, needs care*
 

@@ -79,6 +79,12 @@ New-Item -ItemType Directory -Path $Mods -Force | Out-Null
     + [System.Text.Encoding]::ASCII.GetBytes('LOOSE') `
     + [System.Text.Encoding]::Unicode.GetBytes($MarkIp)))
 
+# A filename carrying characters JSON must escape (Windows forbids " in names,
+# so an apostrophe, a backslash-bearing path and non-ASCII stand in). It
+# appears in -Json output, so a missed escape makes the result unparseable.
+[System.IO.File]::WriteAllBytes("$Mods\odd 'name' $([char]0x00E9).pak",
+    [System.Text.Encoding]::ASCII.GetBytes("ODD$MarkIp"))
+
 # The dropped file, in Documents where the malware writes it (check 5).
 Set-Content -LiteralPath "$Dirty\home\Documents\s.bat" -Value @(
     '@echo off',
@@ -177,6 +183,48 @@ Write-Host ''
 Check ($OutClean -match 'No known indicators of this malware were found') 'reports nothing found'
 Check ($OutClean -match 'not proof that you are clean')                   "keeps the 'not proof you are clean' caveat"
 Check ($RcClean -eq 0)                                                    "exit code 0 when nothing found (got $RcClean)"
+
+# ------------------------------------------------------------- -Json output
+#
+# Fleet scripts parse this, so the contract is: stdout is exactly one valid
+# JSON document, human text never leaks into it, and a scan that could not
+# run still says so in JSON rather than printing nothing.
+
+Write-Host ''
+Write-Host '  Machine-readable output (-Json)'
+Write-Host '  -------------------------------'
+
+function Invoke-JsonScan {
+    param([string[]]$ScanArgs)
+    $errFile = Join-Path $Fix 'json.err'
+    $p = Start-Process -FilePath 'powershell.exe' -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput (Join-Path $Fix 'json.out') -RedirectStandardError $errFile `
+            -ArgumentList (@('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$Scanner`"",'-Json') + $ScanArgs)
+    $out = Get-Content -LiteralPath (Join-Path $Fix 'json.out') -Raw -Encoding UTF8
+    $obj = $null
+    try { $obj = $out | ConvertFrom-Json -ErrorAction Stop } catch { }
+    [pscustomobject]@{ Rc = $p.ExitCode; Out = $out; Obj = $obj
+                       Err = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue) }
+}
+
+$J = Invoke-JsonScan @('-ScanRoot', "`"$Dirty`"", '-Indicators', "`"$TestIoc`"")
+Check ($J.Obj -and $J.Obj.verdict -eq 'indicators_found')  "-Json stdout parses, verdict indicators_found"
+Check ($J.Obj -and ($J.Obj.counts.found + $J.Obj.counts.suspicious) -eq @($J.Obj.findings).Count) `
+      '-Json lists one finding per counted indicator'
+Check ($J.Obj -and [bool](@($J.Obj.findings) | Where-Object { $_.where -like "*odd 'name' $([char]0x00E9).pak" })) `
+      '-Json keeps unusual characters in paths intact'
+Check ($J.Rc -eq 1 -and $J.Obj -and $J.Obj.exit_code -eq 1) "-Json exit_code field matches the real exit code (rc $($J.Rc))"
+Check (-not ($J.Out -match 'Please read this carefully'))   '-Json keeps human text off stdout'
+Check ($J.Err -match 'Please read this carefully')          '-Json still shows the human report on stderr'
+
+$J = Invoke-JsonScan @('-ScanRoot', "`"$Clean`"", '-Indicators', "`"$(Join-Path $Repo 'indicators.json')`"")
+Check ($J.Obj -and $J.Obj.verdict -eq 'no_known_indicators') "-Json clean verdict is no_known_indicators, never 'clean'"
+Check ($J.Obj -and $J.Obj.caveat -match 'not proof')          "-Json carries the 'not proof' caveat"
+
+Set-Content -LiteralPath "$Fix\bad.json" -Value '{ "broken": true }'
+$J = Invoke-JsonScan @('-ScanRoot', "`"$Clean`"", '-Indicators', "`"$Fix\bad.json`"")
+Check ($J.Rc -eq 2 -and $J.Obj -and $J.Obj.verdict -eq 'scan_failed') `
+      "-Json reports scan_failed with exit 2 when it cannot run (rc $($J.Rc))"
 
 # --------------------------------------- repackaged variant, -Deep vs not
 

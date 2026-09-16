@@ -15,7 +15,10 @@ param(
     [string]$ScanRoot,
     [string]$Indicators,
     [switch]$NoColor,
-    [switch]$Deep
+    [switch]$Deep,
+    # One machine-readable JSON result on stdout, for checking many computers
+    # at once. The normal report still appears, on stderr.
+    [switch]$Json
 )
 
 $ErrorActionPreference = 'Continue'
@@ -29,15 +32,50 @@ $script:FoundCount   = 0
 $script:SuspectCount = 0
 $script:NoteCount    = 0
 
+$script:Findings     = New-Object System.Collections.Generic.List[object]
+
+# JSON is UTF-8 by definition, but Windows PowerShell 5.1 writes redirected
+# stdout in the OEM code page, which mangles any non-ASCII path. Some hosts
+# have no console to reconfigure; the output is still usable then, just not
+# guaranteed for non-ASCII names.
+if ($Json) {
+    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+}
+
+# Everything a person reads goes through Show. With -Json it goes to stderr,
+# so stdout carries exactly one JSON document and nothing else -- a stray
+# progress line would make every result unparseable.
+function Show {
+    param([string]$Text, [string]$Color)
+    if ($Json) { [Console]::Error.WriteLine($Text) }
+    elseif ($NoColor -or -not $Color) { Write-Host $Text }
+    else { Write-Host $Text -ForegroundColor $Color }
+}
+
+# Shown, and captured for the report file.
 function Say {
     param([string]$Text, [string]$Color)
     $script:ReportLines.Add($Text)
-    if ($NoColor -or -not $Color) { Write-Host $Text }
-    else { Write-Host $Text -ForegroundColor $Color }
+    Show $Text $Color
+}
+
+# Exit 2 -- the scan could not run. Under -Json this still prints a result, so
+# a sweep of many machines records "failed" rather than silently skipping one.
+function Stop-Scan {
+    param([string[]]$Lines)
+    foreach ($l in $Lines) { [Console]::Error.WriteLine("ERROR: $l") }
+    if ($Json) {
+        [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject ([ordered]@{
+            schema = 1; tool = 'meccha-chameleon-checker'; platform = 'windows'
+            host = $env:COMPUTERNAME; exit_code = 2; verdict = 'scan_failed'; error = $Lines[0]
+        })))
+    }
+    exit 2
 }
 
 function Add-Finding {
     param([ValidateSet('FOUND','SUSPICIOUS')][string]$Severity, [string]$What, [string]$Where)
+    $script:Findings.Add([ordered]@{ severity = $Severity; what = $What; where = $Where })
     if ($Severity -eq 'FOUND') {
         $script:FoundCount++
         Say "  [FOUND]      $What" 'Red'
@@ -55,6 +93,7 @@ function Add-Finding {
 function Add-Note {
     param([string]$What, [string]$Where)
     $script:NoteCount++
+    $script:Findings.Add([ordered]@{ severity = 'WORTH_A_LOOK'; what = $What; where = $Where })
     Say "  [WORTH A LOOK] $What" 'Cyan'
     Say "                 $Where" 'DarkGray'
 }
@@ -73,14 +112,12 @@ function Add-Info { param([string]$Path) $script:InfoLines.Add($Path) }
 # machine, which is the single worst thing this tool could do.
 
 if (-not (Test-Path -LiteralPath $Indicators)) {
-    Write-Error "Cannot read indicators file: $Indicators"
-    exit 2
+    Stop-Scan "Cannot read indicators file: $Indicators"
 }
 try {
     $ioc = Get-Content -LiteralPath $Indicators -Raw -ErrorAction Stop | ConvertFrom-Json
 } catch {
-    Write-Error "Could not parse $Indicators -- refusing to report a misleading 'clean' result."
-    exit 2
+    Stop-Scan "Could not parse $Indicators -- refusing to report a misleading 'clean' result."
 }
 
 $AppId       = [string]$ioc.steam_appid
@@ -90,8 +127,7 @@ $BadStrings  = @($ioc.content_strings)
 $DropNames   = @($ioc.dropped_filenames)
 
 if (-not $AppId -or $BadHashes.Count -eq 0 -or $BadStrings.Count -eq 0) {
-    Write-Error "Indicator file is missing required fields -- refusing to report a misleading 'clean' result."
-    exit 2
+    Stop-Scan "Indicator file is missing required fields -- refusing to report a misleading 'clean' result."
 }
 
 # Does a file contain a marker, as plain text or as UTF-16?
@@ -215,7 +251,7 @@ if ($Synthetic) {
                     Where-Object { $_.DriveType -in 2,3,4,6 } | ForEach-Object { "$($_.DeviceID)\" })
     } catch { }
     $drives = $drives | Sort-Object -Unique
-    Write-Host '  Searching all drives for Steam libraries...' -ForegroundColor DarkGray
+    Show '  Searching all drives for Steam libraries...' 'DarkGray'
 
     foreach ($dr in $drives) {
         foreach ($sub in @('SteamLibrary','Steam','Games\SteamLibrary','Games\Steam',
@@ -452,9 +488,8 @@ if ($Deep) {
         }
     }
     if ($BehavRules.Count -lt 5) {
-        Write-Error "-Deep needs behaviour-rules.tsv, which is missing or unreadable: $rulesFile"
-        Write-Error "Refusing to report 'nothing suspicious' from a scan that could not run."
-        exit 2
+        Stop-Scan @("-Deep needs behaviour-rules.tsv, which is missing or unreadable: $rulesFile",
+                    "Refusing to report 'nothing suspicious' from a scan that could not run.")
     }
 
     $execExt = '^\.(bat|cmd|ps1|psm1|vbs|vbe|js|jse|wsf|hta)$'
@@ -669,8 +704,15 @@ if ($Deep) {
 Say '  --------------------------------------------------------------' 'DarkGray'
 Say ''
 
-$exitCode = 0
+$exitCode   = 0
+$verdict    = 'no_known_indicators'
+$resultText = 'no known indicators found'
+# Carried in -Json output on every verdict, so a fleet dashboard that shows
+# only the verdict still cannot present "no findings" as "clean".
+$caveat = 'No known indicators is not proof a system is clean. The second stage of this attack was never captured, so what it leaves behind is unknown.'
 if ($script:FoundCount -gt 0 -or $script:SuspectCount -gt 0) {
+    $verdict    = 'indicators_found'
+    $resultText = 'INDICATORS FOUND'
     $exitCode = 1
     Say '  Something was found. Please read this carefully.' 'Red'
     Say ''
@@ -693,7 +735,9 @@ if ($script:FoundCount -gt 0 -or $script:SuspectCount -gt 0) {
     Say '      Meccha Chameleon is updated to version 3.2.0 or later.'
     Say ''
 } elseif ($script:NoteCount -gt 0) {
-    $exitCode = 3
+    $exitCode   = 3
+    $verdict    = 'worth_a_look'
+    $resultText = 'no known indicators found; behaviour worth a look'
     Say "  No known malware was found, but $($script:NoteCount) thing(s) are worth a look." 'Cyan'
     Say ''
     Say '  Do not panic. Nothing above matches this malware. The deep scan'
@@ -743,13 +787,44 @@ $header = @(
     'Meccha Chameleon Workshop malware checker',
     "Scan date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
     "Host: $env:COMPUTERNAME",
-    "Result: $(if ($exitCode -eq 0) { 'no known indicators found' } else { 'INDICATORS FOUND' })",
+    "Result: $resultText",
     ''
 )
 try {
-    Set-Content -LiteralPath $reportFile -Value ($header + $script:ReportLines) -Encoding UTF8
-    Write-Host "  A copy of this report was saved to:" -ForegroundColor DarkGray
-    Write-Host "  $reportFile`n" -ForegroundColor DarkGray
-} catch { }
+    Set-Content -LiteralPath $reportFile -Value ($header + $script:ReportLines) -Encoding UTF8 -ErrorAction Stop
+    Show '  A copy of this report was saved to:' 'DarkGray'
+    Show "  $reportFile`n" 'DarkGray'
+} catch { $reportFile = $null }
+
+# ------------------------------------------------------------- -Json result
+#
+# The schema is documented in docs/HOW-IT-WORKS.md and is a promise: fleet
+# scripts parse it. Add fields freely; renaming or removing one means bumping
+# "schema". Arrays go through @() so a single entry is never unwrapped into a
+# bare object.
+if ($Json) {
+    $result = [ordered]@{
+        schema             = 1
+        tool               = 'meccha-chameleon-checker'
+        platform           = 'windows'
+        host               = $env:COMPUTERNAME
+        scan_date          = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        indicators_updated = [string]$ioc.updated
+        deep               = [bool]$Deep
+        exit_code          = $exitCode
+        verdict            = $verdict
+        counts             = [ordered]@{
+            found        = $script:FoundCount
+            suspicious   = $script:SuspectCount
+            worth_a_look = $script:NoteCount
+        }
+        findings           = @($script:Findings)
+        context_files      = @($script:InfoLines)
+        steam_libraries    = @($SteamRoots)
+        report_file        = $reportFile
+        caveat             = $caveat
+    }
+    [Console]::Out.WriteLine((ConvertTo-Json -InputObject $result -Depth 5 -Compress))
+}
 
 exit $exitCode

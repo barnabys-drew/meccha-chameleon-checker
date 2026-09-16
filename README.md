@@ -226,7 +226,7 @@ bash tests/make-fixtures.sh                                                   # 
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\make-fixtures.ps1    # Windows
 ```
 
-Both report **13 passed, 0 failed**.
+Both must finish with **0 failed**; CI runs them on real Ubuntu and Windows runners.
 
 Fixtures are generated at runtime and never committed: a repo containing a `.bat` with the real
 payload string would be flagged by antivirus and by GitHub. Generated fixtures are inert — `echo`
@@ -238,6 +238,11 @@ statements only — and marker strings are assembled from fragments at runtime.
 | `1` | Indicators found |
 | `2` | The scan could not run |
 | `3` | Deep scan only — behaviour worth a look, no known indicators |
+
+**Checking a room full of PCs** — a school lab, internet café or LAN party? Add `--json` (Linux) or
+`-Json` (Windows) and each scan prints a single JSON result on stdout, with the normal report moved
+to stderr, ready to collect into one place. The schema is in
+[HOW-IT-WORKS](docs/HOW-IT-WORKS.md#machine-readable-output).
 
 ### Detection coverage, honestly
 

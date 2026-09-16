@@ -108,6 +108,32 @@ mkdir -p "$CLEAN/home/Documents" "$CLEAN/home/.config/autostart"
 printf 'a completely normal community map\n' \
     > "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222/nice.pak"
 
+# Unreal containers whose contents a byte search cannot see. Headers follow the
+# real UE5 layouts (checked against shipping games): the scan must SAY it could
+# not look inside these, rather than count them as examined and clean.
+CW="$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222"
+le32() { printf "\\x$(printf %02x $(( $1 & 255 )))\\x$(printf %02x $(( ($1 >> 8) & 255 )))\\x$(printf %02x $(( ($1 >> 16) & 255 )))\\x$(printf %02x $(( ($1 >> 24) & 255 )))"; }
+zeros() { head -c "$1" /dev/zero; }
+name32() { printf '%s' "$1"; zeros $(( 32 - ${#1} )); }
+utoc() {  # utoc <flags> <method name or empty>
+    local nmeth=0; [ -n "$2" ] && nmeth=1
+    printf -- '-==--==--==--==-'; printf '\x08'; zeros 3           # magic, version 8
+    le32 144; le32 1; le32 1; le32 12; le32 "$nmeth"; le32 32      # header size .. name length
+    le32 65536; le32 0; le32 1; zeros 8; zeros 16                  # block size .. key GUID
+    printf "\\x$(printf %02x "$1")"; zeros 3; le32 0; zeros 8      # flags, hash seeds, partition size
+    le32 0; zeros 4; zeros 40                                      # to 144 bytes
+    zeros 22; zeros 12                                             # one chunk ID + offset, one block
+    [ -n "$2" ] && name32 "$2"
+}
+utoc 9 "Oodle"  > "$CW/oodle.utoc";  printf 'opaque compressed bytes' > "$CW/oodle.ucas"
+utoc 10 ""      > "$CW/locked.utoc"
+utoc 8 ""       > "$CW/plain.utoc"
+{   # A legacy .pak ending in a version 11 footer that lists Zlib.
+    printf 'opaque compressed bytes'
+    zeros 16; printf '\x00'; printf '\xe1\x12\x6f\x5a'; le32 11
+    zeros 8; zeros 8; zeros 20; name32 "Zlib"; zeros 128
+} > "$CW/zlib.pak"
+
 # ------------------------------------------------------------- variant tree
 #
 # A repackaged copy of the same malware: different Workshop ID, different file
@@ -189,6 +215,24 @@ echo "$OUT_CLEAN" | grep -qF "not proof that you are clean" \
 [ "$RC_CLEAN" -eq 0 ] \
     && ok "exit code 0 when nothing found"        || bad "exit code 0 when nothing found (got $RC_CLEAN)"
 
+# Containers the byte search cannot see into are named, with the reason, and
+# do not change the verdict -- compression is normal, not a warning sign.
+echo "$OUT_CLEAN" | grep -qF "Could not look inside 4 map file(s)" \
+    && ok "reports how many map files could not be looked inside" \
+    || bad "reports how many map files could not be looked inside"
+echo "$OUT_CLEAN" | grep -qF "oodle.ucas (compressed with Oodle)" \
+    && ok "reads the compression method from a .utoc, for its .ucas" \
+    || bad "reads the compression method from a .utoc, for its .ucas"
+echo "$OUT_CLEAN" | grep -qF "locked.utoc (encrypted)" \
+    && ok "recognises an encrypted IoStore container" \
+    || bad "recognises an encrypted IoStore container"
+echo "$OUT_CLEAN" | grep -qF "zlib.pak (compressed with Zlib)" \
+    && ok "reads the compression method from a legacy .pak footer" \
+    || bad "reads the compression method from a legacy .pak footer"
+echo "$OUT_CLEAN" | grep -qE "plain\.utoc|nice\.pak" \
+    && bad "does not list containers whose bytes are searchable" \
+    || ok "does not list containers whose bytes are searchable"
+
 # --------------------------------------------- refuses to run without IOCs
 
 echo
@@ -238,6 +282,9 @@ if command -v python3 >/dev/null 2>&1; then
     [ "$(json_field "$J_CLEAN" 'd["verdict"]')" = "no_known_indicators" ] \
         && ok "--json clean verdict is no_known_indicators, never 'clean'" \
         || bad "--json clean verdict is no_known_indicators, never 'clean'"
+    [ "$(json_field "$J_CLEAN" 'len(d["uninspected_files"])')" = "4" ] \
+        && ok "--json lists files that could not be looked inside" \
+        || bad "--json lists files that could not be looked inside"
     json_field "$J_CLEAN" 'd["caveat"]' | grep -qF "not proof" \
         && ok "--json carries the 'not proof' caveat" \
         || bad "--json carries the 'not proof' caveat"

@@ -120,6 +120,37 @@ New-Item -ItemType Directory -Path "$Clean\home\Startup"   -Force | Out-Null
 Set-Content -LiteralPath "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222\nice.pak" `
             -Value 'a completely normal community map'
 
+# Unreal containers whose contents a byte search cannot see. Headers follow the
+# real UE5 layouts (checked against shipping games): the scan must SAY it could
+# not look inside these, rather than count them as examined and clean.
+$Cw = "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222"
+function New-Name32 { param([string]$N) $b = New-Object byte[] 32; [System.Text.Encoding]::ASCII.GetBytes($N).CopyTo($b, 0); ,$b }  # comma: return byte[], not unrolled
+function New-Utoc {
+    param([string]$Path, [byte]$Flags, [string]$Method)
+    $ms = New-Object System.IO.MemoryStream
+    $w  = New-Object System.IO.BinaryWriter $ms
+    $w.Write([System.Text.Encoding]::ASCII.GetBytes('-==--==--==--==-'))
+    $w.Write([byte]8); $w.Write((New-Object byte[] 3))                     # version 8
+    $nmeth = if ($Method) { 1 } else { 0 }
+    foreach ($v in 144, 1, 1, 12, $nmeth, 32, 65536, 0, 1) { $w.Write([uint32]$v) }
+    $w.Write((New-Object byte[] 24))                                       # container ID, key GUID
+    $w.Write($Flags); $w.Write((New-Object byte[] 3)); $w.Write([uint32]0) # flags, hash seeds
+    $w.Write((New-Object byte[] 8)); $w.Write([uint32]0)                   # partition size, no-hash count
+    $w.Write((New-Object byte[] 44))                                       # to 144 bytes
+    $w.Write((New-Object byte[] 34))                                       # one chunk ID + offset, one block
+    if ($Method) { $w.Write((New-Name32 $Method)) }
+    $w.Flush(); [System.IO.File]::WriteAllBytes($Path, $ms.ToArray())
+}
+New-Utoc "$Cw\oodle.utoc"  9  'Oodle'
+New-Utoc "$Cw\locked.utoc" 10 ''
+New-Utoc "$Cw\plain.utoc"  8  ''
+[System.IO.File]::WriteAllBytes("$Cw\oodle.ucas", [System.Text.Encoding]::ASCII.GetBytes('opaque compressed bytes'))
+$ms = New-Object System.IO.MemoryStream; $w = New-Object System.IO.BinaryWriter $ms
+$w.Write([System.Text.Encoding]::ASCII.GetBytes('opaque compressed bytes'))
+$w.Write((New-Object byte[] 17)); $w.Write([uint32]0x5A6F12E1); $w.Write([uint32]11)   # v11 footer
+$w.Write((New-Object byte[] 36)); $w.Write((New-Name32 'Zlib')); $w.Write((New-Object byte[] 128))
+$w.Flush(); [System.IO.File]::WriteAllBytes("$Cw\zlib.pak", $ms.ToArray())
+
 # -------------------------------------------------------------- variant tree
 #
 # A repackaged copy of the same malware: different Workshop ID, different file
@@ -184,6 +215,14 @@ Check ($OutClean -match 'No known indicators of this malware were found') 'repor
 Check ($OutClean -match 'not proof that you are clean')                   "keeps the 'not proof you are clean' caveat"
 Check ($RcClean -eq 0)                                                    "exit code 0 when nothing found (got $RcClean)"
 
+# Containers the byte search cannot see into are named, with the reason, and
+# do not change the verdict -- compression is normal, not a warning sign.
+Check ($OutClean -match 'Could not look inside 4 map file\(s\)')          'reports how many map files could not be looked inside'
+Check ($OutClean -match 'oodle\.ucas \(compressed with Oodle\)')          'reads the compression method from a .utoc, for its .ucas'
+Check ($OutClean -match 'locked\.utoc \(encrypted\)')                     'recognises an encrypted IoStore container'
+Check ($OutClean -match 'zlib\.pak \(compressed with Zlib\)')             'reads the compression method from a legacy .pak footer'
+Check (-not ($OutClean -match 'plain\.utoc|nice\.pak'))                   'does not list containers whose bytes are searchable'
+
 # ------------------------------------------------------------- -Json output
 #
 # Fleet scripts parse this, so the contract is: stdout is exactly one valid
@@ -229,6 +268,7 @@ Check ($J.Err -match 'Please read this carefully')          '-Json still shows t
 
 $J = Invoke-JsonScan @('-ScanRoot', "`"$Clean`"", '-Indicators', "`"$(Join-Path $Repo 'indicators.json')`"")
 Check ($J.Obj -and $J.Obj.verdict -eq 'no_known_indicators') "-Json clean verdict is no_known_indicators, never 'clean'"
+Check ($J.Obj -and @($J.Obj.uninspected_files).Count -eq 4)   '-Json lists files that could not be looked inside'
 Check ($J.Obj -and $J.Obj.caveat -match 'not proof')          "-Json carries the 'not proof' caveat"
 
 Set-Content -LiteralPath "$Fix\bad.json" -Value '{ "broken": true }'

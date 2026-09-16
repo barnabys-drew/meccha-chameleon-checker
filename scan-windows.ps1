@@ -181,6 +181,91 @@ function Test-ContainsMarker {
     return $null
 }
 
+# What a byte search can't see.
+#
+# Checks 4 and B3 search a map file's raw bytes. That only works when the data
+# is stored as-is. Unreal usually compresses it -- UE5 defaults to Oodle, which
+# is proprietary and compiled into each game, so no zero-dependency tool can
+# undo it -- and can encrypt it with a key only the game has. In either case a
+# marker inside is invisible, and the search would quietly say "not found".
+#
+# This reads only the container's header or footer and never decompresses
+# anything. It returns why the raw bytes cannot be searched, or $null if they
+# can. The layouts below were checked against shipping UE5 games.
+function Get-ContainerBlindReason {
+    param([string]$Path)
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    # A .ucas holds the data; its .utoc next to it says how it is stored.
+    if ($ext -eq '.ucas') {
+        $Path = [System.IO.Path]::ChangeExtension($Path, '.utoc')
+        $ext  = '.utoc'
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    }
+    if ($ext -ne '.utoc' -and $ext -ne '.pak') { return $null }
+
+    $fs = $null
+    try {
+        $fs   = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        $br   = New-Object System.IO.BinaryReader $fs
+        $size = $fs.Length
+
+        $readNames = {
+            param([long]$Offset, [long]$Count)
+            $names = @()
+            for ($i = 0; $i -lt [Math]::Min($Count, 8); $i++) {
+                if ($Offset + ($i + 1) * 32 -gt $size) { break }
+                [void]$fs.Seek($Offset + $i * 32, 'Begin')
+                $n = ([System.Text.Encoding]::ASCII.GetString($br.ReadBytes(32)) -replace '[^A-Za-z0-9_]', '')
+                if ($n) { $names += $n }
+            }
+            $names -join ', '
+        }
+
+        if ($ext -eq '.utoc') {
+            # FIoStoreTocHeader, 144 bytes, starting with a 16-byte magic.
+            if ($size -lt 144) { return $null }
+            if ([System.Text.Encoding]::ASCII.GetString($br.ReadBytes(16)) -ne '-==--==--==--==-') { return $null }
+            [void]$fs.Seek(20, 'Begin')
+            $hdr = $br.ReadUInt32(); $entries = $br.ReadUInt32(); $blocks = $br.ReadUInt32()
+            $bsize = $br.ReadUInt32(); $nmeth = $br.ReadUInt32(); $nlen = $br.ReadUInt32()
+            [void]$fs.Seek(80, 'Begin'); $flags = $br.ReadByte()
+            [void]$fs.Seek(84, 'Begin'); $seeds = $br.ReadUInt32()
+            [void]$fs.Seek(96, 'Begin'); $nophash = $br.ReadUInt32()
+            if ($flags -band 2) { return 'encrypted' }
+            if ($nmeth -eq 0) { return $null }
+            # Method names follow the header, the chunk ID (12 bytes) and offset
+            # (10 bytes) tables, the perfect-hash tables and the block table.
+            $off = [long]$hdr + [long]$entries * 22 + [long]$seeds * 4 + [long]$nophash * 4 + [long]$blocks * $bsize
+            $names = if ($nlen -eq 32) { & $readNames $off $nmeth } else { '' }
+            if ($names) { return "compressed with $names" } else { return 'compressed' }
+        }
+
+        # FPakInfo footer: magic E1 12 6F 5A, a fixed distance from the end that
+        # depends on the pak version, then compression method names running to
+        # end of file. The byte before the magic flags an encrypted index.
+        foreach ($pos in 204, 205, 172, 44) {
+            if ($size -lt $pos) { continue }
+            [void]$fs.Seek($size - $pos, 'Begin')
+            if ($br.ReadUInt32() -ne 0x5A6F12E1) { continue }
+            $ver = $br.ReadUInt32()
+            if ($pos -ne 44) {
+                [void]$fs.Seek($size - $pos - 1, 'Begin')
+                if ($br.ReadByte() -eq 1) { return 'encrypted' }
+            }
+            $off = $size - $pos + 44
+            if ($ver -eq 9) { $off++ }
+            $names = & $readNames $off ([Math]::Floor(($size - $off) / 32))
+            if ($names) { return "compressed with $names" }
+            return $null
+        }
+        return $null
+    } catch {
+        return $null
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
+}
+
 # Bounded breadth-first hunt for a "steamapps" folder, returning its parent.
 #
 # Deliberately not Get-ChildItem -Recurse: that walks the entire drive before
@@ -348,6 +433,10 @@ function Get-MapFiles {
 
 Say '  Checking your Workshop maps...' 'White'
 
+# Map files whose contents a byte search cannot see, and why. Reported, so a
+# "nothing found" never silently includes files that were not really examined.
+$BlindFiles = New-Object System.Collections.Generic.List[object]
+
 foreach ($dir in @($ItemDirs) + @($ModDirs)) {
     # Check 2: known-bad Workshop ID. Loose mod folders have no ID to check.
     $name = Split-Path -Leaf $dir
@@ -366,6 +455,9 @@ foreach ($dir in @($ItemDirs) + @($ModDirs)) {
         $hit = Test-ContainsMarker -Path $pak.FullName -Markers $BadStrings
         if ($hit) {
             Add-Finding SUSPICIOUS "Map file contains a known malware marker (`"$hit`")" $pak.FullName
+        } else {
+            $reason = Get-ContainerBlindReason -Path $pak.FullName
+            if ($reason) { $BlindFiles.Add([pscustomobject]@{ Path = $pak.FullName; Reason = $reason }) }
         }
     }
 }
@@ -374,6 +466,19 @@ if ($ItemDirs.Count -eq 0 -and $ModDirs.Count -eq 0) {
     Say '  No Meccha Chameleon Workshop maps are installed.' 'Green'
 } else {
     Say "  Examined $($ItemDirs.Count) Workshop map(s) and $($ModDirs.Count) mod folder(s)." 'DarkGray'
+}
+if ($BlindFiles.Count -gt 0) {
+    # Deliberately quiet: this is normal for most Unreal maps, not a warning
+    # sign. It is here so the result is honest about what was examined.
+    Say "  Could not look inside $($BlindFiles.Count) map file(s) because they are compressed or" 'DarkGray'
+    Say '  encrypted -- normal for Unreal maps, but a malware marker inside them' 'DarkGray'
+    Say '  would not be seen. The map ID and file fingerprint checks still apply.' 'DarkGray'
+    $i = 0
+    foreach ($b in $BlindFiles) {
+        if ($i -ge 5) { Say "      ...and $($BlindFiles.Count - 5) more" 'DarkGray'; break }
+        Say "      $($b.Path) ($($b.Reason))" 'DarkGray'
+        $i++
+    }
 }
 Say ''
 
@@ -846,6 +951,9 @@ if ($Json) {
                         ',"worth_a_look":' + [int]$script:NoteCount + '}')
         [void]$j.Append(',"findings":['         + $findingsJson + ']')
         [void]$j.Append(',"context_files":'     + (ConvertTo-JsonArray $script:InfoLines))
+        [void]$j.Append(',"uninspected_files":[' + (@($BlindFiles | ForEach-Object {
+            '{"path":' + (ConvertTo-JsonText $_.Path) + ',"reason":' + (ConvertTo-JsonText $_.Reason) + '}'
+        }) -join ',') + ']')
         [void]$j.Append(',"steam_libraries":'   + (ConvertTo-JsonArray $SteamRoots))
         [void]$j.Append(',"report_file":'       + (ConvertTo-JsonText $reportFile))
         [void]$j.Append(',"caveat":'            + (ConvertTo-JsonText $caveat) + '}')

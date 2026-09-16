@@ -201,8 +201,9 @@ there.
 - It detects the **dropper**, not the second stage. The second stage was never publicly analysed.
 - The library search is depth-limited and skips system folders, so a library buried somewhere very
   unusual could be missed. Every library it *did* find is listed in the output.
-- Scanning inside map files can miss a marker if the map data is compressed. Checks 2 and 3 are the
-  reliable ones; check 4 is a bonus.
+- Scanning inside map files can't see through compression or encryption, which Unreal maps often
+  use. When that happens the result **says so and names the files** instead of quietly counting them
+  as checked. Checks 2 and 3 are the reliable ones; check 4 is a bonus.
 - **It is not an antivirus** and is no substitute for one.
 
 All indicators live in [`indicators.json`](indicators.json), so they can be audited and updated

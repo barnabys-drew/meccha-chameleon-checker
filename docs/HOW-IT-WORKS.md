@@ -78,6 +78,21 @@ whole-machine scan took **64 seconds**; with it, **~3 seconds**.
 Check 4 strips `NUL` bytes before matching, which turns UTF-16LE into ASCII, so one pass covers both
 encodings — Unreal string literals are commonly UTF-16.
 
+**Check 4 says when it's blind.** A byte search only sees data stored as-is. When check 4 finds no
+marker, the scanner reads the container's header (`.utoc`, which also covers its `.ucas`) or footer
+(`.pak`). If the data is compressed or encrypted, the file is listed as *could not look inside*, with
+the reason (`compressed with Oodle`, `encrypted`). It never decompresses anything; it only reads the
+metadata that says how the data is stored. The listing is quiet, doesn't affect the verdict or exit
+code, and appears in `--json` as `uninspected_files`. Compression is normal for Unreal maps, not a
+warning sign, but "nothing found" must not quietly include files nobody could read.
+
+Layouts used, both confirmed against shipping UE5 games:
+
+| Container | Where it says how data is stored |
+|---|---|
+| `.utoc` (IoStore, UE5) | 144-byte `FIoStoreTocHeader`: flags byte at `0x50` (`0x02` = encrypted), compression method count at `0x24`. Method names follow the chunk ID, offset, perfect-hash and block tables |
+| `.pak` (legacy) | `FPakInfo` footer, magic `E1 12 6F 5A` at 204/205/172/44 bytes from the end depending on version; the byte before it flags an encrypted index; method names run to end of file |
+
 Checks 3 and 4 (and the `--deep` capability check) run over every place a map can sit on disk, not
 just the subscribed install:
 
@@ -191,6 +206,10 @@ human-readable line to stderr. It's for sweeping many machines. The report file 
       "where": "/home/user/.local/share/Steam/steamapps/workshop/content/4704690/3765145606" }
   ],
   "context_files": [],
+  "uninspected_files": [
+    { "path": "/home/user/.local/share/Steam/steamapps/workshop/content/4704690/3765145606/pakchunk99.ucas",
+      "reason": "compressed with Oodle" }
+  ],
   "steam_libraries": ["/home/user/.local/share/Steam"],
   "report_file": "/home/user/meccha-chameleon-checker/meccha-check-report-20260916-180000.txt",
   "caveat": "No known indicators is not proof a system is clean. ..."
@@ -202,6 +221,7 @@ human-readable line to stderr. It's for sweeping many machines. The report file 
 | `verdict` | `indicators_found` (exit 1), `worth_a_look` (exit 3), `no_known_indicators` (exit 0), `scan_failed` (exit 2) |
 | `findings[].severity` | `FOUND`, `SUSPICIOUS`, `WORTH_A_LOOK` — the same three tiers as the text report |
 | `context_files` | `--deep` only: program-type files in Documents that did **not** score. Context, never findings |
+| `uninspected_files` | `[{ "path", "reason" }]` — map files check 4 could not search inside, e.g. `compressed with Oodle`, `encrypted`. Not findings |
 | `report_file` | `null` if the report couldn't be written |
 
 Rules the schema keeps:
@@ -290,15 +310,26 @@ persists as, or what it steals. Every check here targets the **dropper**. If you
 sandbox telemetry from one, that is by far the most valuable thing you could contribute — it's the
 reason the tool refuses to tell anyone they're clean.
 
-### 2. No real `.pak` parsing — *hard, highest technical value*
+### 2. No decompression of map files — *hard; partly blocked*
 
-Check 4 does a raw byte scan. If a map's data is compressed (Oodle/Zlib inside a UE4 pak or UE5
-IoStore container), embedded strings are invisible and the check silently misses them. Proper
-support means parsing the pak/utoc/ucas index and decompressing entries before scanning.
+Check 4 and the `--deep` capability check search raw bytes. They no longer miss compressed data
+*silently*: container metadata is read and uninspectable files are named (see
+[the checks](#ioc-checks-default)). But they still can't see *inside* those files.
 
-This would upgrade check 4 and the `--deep` capability check from best-effort to reliable, and it's
-the single biggest detection improvement available. Needs someone comfortable with Unreal container
-formats.
+What's left, split by how blocked it is:
+
+- **Zlib / uncompressed blocks — hard, doable.** Walk the `.utoc` block table (or the `.pak` index),
+  inflate Zlib blocks, and search the result. .NET has `DeflateStream`; bash would need the
+  `gzip`-header trick or would stay best-effort.
+- **Oodle — blocked by the zero-dependency rule.** UE5 compresses with Oodle by default. It's
+  proprietary and compiled into each game, so nothing stock on Windows or Linux can decompress it.
+  Real support means an optional external tool, which is a design-constraint conversation, not a PR.
+- **Encrypted containers — blocked.** The AES key is inside the game binary. Extracting it is out of
+  scope for a tool like this.
+
+Real-world data would settle the priority. Are Meccha Chameleon Workshop maps actually shipped
+Oodle-compressed, Zlib, or stored? The scanner now reports that per file, so a few users' `--json`
+output would answer it.
 
 ### 3. No Blueprint graph analysis — *hard, follows from #2*
 

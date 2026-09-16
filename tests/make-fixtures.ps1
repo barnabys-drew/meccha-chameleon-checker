@@ -218,7 +218,7 @@ function Invoke-JsonScan {
 }
 
 $J = Invoke-JsonScan @('-ScanRoot', "`"$Dirty`"", '-Indicators', "`"$TestIoc`"")
-Check ($J.Obj -and $J.Obj.verdict -eq 'indicators_found')  "-Json stdout parses, verdict indicators_found"
+Check ($J.Obj -and $J.Obj.verdict -eq 'indicators_found')  "-Json stdout parses, verdict indicators_found (got $($J.Obj.verdict) $($J.Obj.error))"
 Check ($J.Obj -and ($J.Obj.counts.found + $J.Obj.counts.suspicious) -eq @($J.Obj.findings).Count) `
       '-Json lists one finding per counted indicator'
 Check ($J.Obj -and [bool](@($J.Obj.findings) | Where-Object { $_.where -like "*odd 'name' $([char]0x00E9).pak" })) `

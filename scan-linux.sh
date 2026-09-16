@@ -201,6 +201,82 @@ contains_string() {
     LC_ALL=C tr -d '\000' < "$file" 2>/dev/null | LC_ALL=C grep -qaF -- "$needle"
 }
 
+# ------------------------------------------------ what a byte search can't see
+#
+# Checks 4 and B3 search a map file's raw bytes. That only works when the data
+# is stored as-is. Unreal usually compresses it -- UE5 defaults to Oodle, which
+# is proprietary and compiled into each game, so no zero-dependency tool can
+# undo it -- and can encrypt it with a key only the game has. In either case a
+# marker inside is invisible, and the search would quietly say "not found".
+#
+# This reads only the container's header or footer and never decompresses
+# anything. It prints why the raw bytes cannot be searched, or nothing if they
+# can. The layouts below were checked against shipping UE5 games.
+
+u8_at()  { od -An -t u1 -j "$2" -N 1 "$1" 2>/dev/null | tr -d ' \n'; }
+u32_at() { od -An -t u4 --endian=little -j "$2" -N 4 "$1" 2>/dev/null | tr -d ' \n'; }
+
+# A run of fixed-width, NUL-padded compression method names, joined by ", ".
+method_names() {  # method_names <file> <offset> <count> <width>
+    local i n out=""
+    for (( i = 0; i < $3 && i < 8; i++ )); do
+        n="$(LC_ALL=C tail -c +$(( $2 + i * $4 + 1 )) "$1" 2>/dev/null | head -c "$4" \
+             | LC_ALL=C tr -d '\000' | LC_ALL=C tr -cd 'A-Za-z0-9_')"
+        [ -n "$n" ] && out="${out:+$out, }$n"
+    done
+    printf '%s' "$out"
+}
+
+container_blind_reason() {  # container_blind_reason <.pak|.utoc|.ucas>
+    local f="$1" size ver flags hdr entries blocks bsize nmeth nlen seeds nophash off names pos
+    case "${f,,}" in
+        # A .ucas holds the data; its .utoc next to it says how it is stored.
+        *.ucas) f="${f%.*}.utoc"; [ -r "$f" ] || return 0 ;;
+    esac
+    size="$(stat -c %s "$f" 2>/dev/null)" || return 0
+
+    case "${f,,}" in
+    *.utoc)
+        # FIoStoreTocHeader, 144 bytes, starting with a 16-byte magic.
+        [ "$size" -ge 144 ] || return 0
+        [ "$(LC_ALL=C head -c 16 "$f")" = "-==--==--==--==-" ] || return 0
+        flags="$(u8_at "$f" 80)"
+        if (( flags & 2 )); then echo "encrypted"; return 0; fi
+        nmeth="$(u32_at "$f" 36)"
+        [ "${nmeth:-0}" -gt 0 ] || return 0
+        # Method names follow the header, the chunk ID (12 bytes) and offset
+        # (10 bytes) tables, the perfect-hash tables and the block table.
+        hdr="$(u32_at "$f" 20)";    entries="$(u32_at "$f" 24)"
+        blocks="$(u32_at "$f" 28)"; bsize="$(u32_at "$f" 32)"; nlen="$(u32_at "$f" 40)"
+        seeds="$(u32_at "$f" 84)";  nophash="$(u32_at "$f" 96)"
+        off=$(( hdr + entries * 22 + seeds * 4 + nophash * 4 + blocks * bsize ))
+        names=""
+        [ "$nlen" = 32 ] && [ $(( off + nmeth * nlen )) -le "$size" ] \
+            && names="$(method_names "$f" "$off" "$nmeth" 32)"
+        echo "compressed${names:+ with $names}"
+        ;;
+    *.pak)
+        # FPakInfo footer: magic E1 12 6F 5A, a fixed distance from the end
+        # that depends on the pak version, then compression method names
+        # running to end of file. The byte before the magic flags an
+        # encrypted index.
+        for pos in 204 205 172 44; do
+            [ "$size" -ge "$pos" ] || continue
+            [ "$(od -An -t x1 -j $(( size - pos )) -N 4 "$f" 2>/dev/null | tr -d ' \n')" = "e1126f5a" ] || continue
+            ver="$(u32_at "$f" $(( size - pos + 4 )))"
+            if [ "$pos" != 44 ] && [ "$(u8_at "$f" $(( size - pos - 1 )))" = 1 ]; then
+                echo "encrypted"; return 0
+            fi
+            off=$(( size - pos + 44 )); [ "$ver" = 9 ] && off=$(( off + 1 ))
+            names="$(method_names "$f" "$off" $(( (size - off) / 32 )) 32)"
+            [ -n "$names" ] && echo "compressed with $names"
+            return 0
+        done
+        ;;
+    esac
+    return 0
+}
+
 # --------------------------------------------------------------------- banner
 
 say ""
@@ -343,9 +419,14 @@ done
 
 say "${C_BLD}  Checking your Workshop maps...${C_OFF}"
 
+# Map files whose contents a byte search cannot see, and why. Reported, so a
+# "nothing found" never silently includes files that were not really examined.
+BLIND_FILES=()
+BLIND_REASONS=()
+
 # Checks 3 and 4: hash and byte-scan the Unreal asset containers under a folder.
 scan_map_files() {  # scan_map_files <dir>
-    local pak h bad s
+    local pak h bad s hit reason
     while IFS= read -r -d '' pak; do
         h="$(sha256sum "$pak" 2>/dev/null | cut -d' ' -f1 | tr 'A-Z' 'a-z')"
         for bad in "${BAD_HASHES[@]}"; do
@@ -353,12 +434,20 @@ scan_map_files() {  # scan_map_files <dir>
                 finding FOUND "Map file matches a known malicious file exactly" "$pak"
             fi
         done
+        hit=0
         for s in "${BAD_STRINGS[@]}"; do
             if contains_string "$pak" "$s"; then
                 finding SUSPICIOUS "Map file contains a known malware marker (\"$s\")" "$pak"
+                hit=1
                 break
             fi
         done
+        if [ "$hit" = 0 ]; then
+            reason="$(container_blind_reason "$pak")"
+            if [ -n "$reason" ]; then
+                BLIND_FILES+=("$pak"); BLIND_REASONS+=("$reason")
+            fi
+        fi
     done < <(find "$1" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
 }
 
@@ -384,6 +473,20 @@ if [ "${#ITEM_DIRS[@]}" -eq 0 ] && [ "${#MOD_DIRS[@]}" -eq 0 ]; then
     say "  ${C_GRN}No Meccha Chameleon Workshop maps are installed.${C_OFF}"
 else
     say "  ${C_DIM}Examined ${#ITEM_DIRS[@]} Workshop map(s) and ${#MOD_DIRS[@]} mod folder(s).${C_OFF}"
+fi
+if [ "${#BLIND_FILES[@]}" -gt 0 ]; then
+    # Deliberately quiet: this is normal for most Unreal maps, not a warning
+    # sign. It is here so the result is honest about what was examined.
+    say "  ${C_DIM}Could not look inside ${#BLIND_FILES[@]} map file(s) because they are compressed or${C_OFF}"
+    say "  ${C_DIM}encrypted -- normal for Unreal maps, but a malware marker inside them${C_OFF}"
+    say "  ${C_DIM}would not be seen. The map ID and file fingerprint checks still apply.${C_OFF}"
+    for (( i = 0; i < ${#BLIND_FILES[@]}; i++ )); do
+        if [ "$i" -ge 5 ]; then
+            say "  ${C_DIM}    ...and $(( ${#BLIND_FILES[@]} - 5 )) more${C_OFF}"
+            break
+        fi
+        say "  ${C_DIM}    ${BLIND_FILES[$i]} (${BLIND_REASONS[$i]})${C_OFF}"
+    done
 fi
 say ""
 
@@ -813,6 +916,10 @@ if [ "$JSON" = 1 ]; then
     join_json() { local IFS=,; printf '%s' "$*"; }
     libs=(); for r in "${STEAM_ROOTS[@]:-}"; do [ -n "$r" ] && libs+=("$(json_str "$r")"); done
     ctx=();  for c in "${INFO_LINES[@]:-}";  do [ -n "$c" ] && ctx+=("$(json_str "$c")"); done
+    blind=()
+    for (( i = 0; i < ${#BLIND_FILES[@]}; i++ )); do
+        blind+=("{\"path\":$(json_str "${BLIND_FILES[$i]}"),\"reason\":$(json_str "${BLIND_REASONS[$i]}")}")
+    done
     printf '{"schema":1,"tool":"meccha-chameleon-checker","platform":"linux"'
     printf ',"host":%s'               "$(json_str "$(uname -n 2>/dev/null)")"
     printf ',"scan_date":%s'          "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
@@ -823,6 +930,7 @@ if [ "$JSON" = 1 ]; then
         "$FOUND_COUNT" "$SUSPECT_COUNT" "$NOTE_COUNT"
     printf ',"findings":[%s]'         "$(join_json "${FINDINGS_JSON[@]:-}")"
     printf ',"context_files":[%s]'    "$(join_json "${ctx[@]:-}")"
+    printf ',"uninspected_files":[%s]' "$(join_json "${blind[@]:-}")"
     printf ',"steam_libraries":[%s]'  "$(join_json "${libs[@]:-}")"
     printf ',"report_file":%s'        "$([ -n "$REPORT_FILE" ] && json_str "$REPORT_FILE" || echo null)"
     printf ',"caveat":%s}\n'          "$(json_str "$CAVEAT")"

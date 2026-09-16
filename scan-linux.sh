@@ -184,12 +184,14 @@ if [ -n "$SCAN_ROOT" ]; then
     HOME_DIR="$SCAN_ROOT/home"
     [ -d "$SCAN_ROOT/steamroot" ] && STEAM_ROOTS+=("$SCAN_ROOT/steamroot")
 else
-    # (a) The standard per-user install locations, including Flatpak.
+    # (a) The standard per-user install locations, including Flatpak, and
+    #     ~/Steam, where steamcmd installs by default.
     for cand in \
         "$HOME/.steam/steam" \
         "$HOME/.steam/root" \
         "$HOME/.local/share/Steam" \
-        "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+        "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam" \
+        "$HOME/Steam"
     do
         [ -d "$cand/steamapps" ] && STEAM_ROOTS+=("$cand")
     done
@@ -265,47 +267,87 @@ fi
 
 # ----------------------------------------------- checks 2+3+4: workshop maps
 
-say "${C_BLD}  Checking your subscribed Workshop maps...${C_OFF}"
-
-WORKSHOP_DIRS_SEEN=0
+# Every place a map can sit on disk, gathered once so the IOC checks and the
+# --deep capability check always examine the same set.
+#
+#   ITEM_DIRS  one folder per Workshop item, named by its Workshop ID. Both the
+#              finished install (content/) and Steam's staging area for an
+#              interrupted or in-progress download (downloads/) -- a partial
+#              download is still a malicious file on disk.
+#   MOD_DIRS   folders of loose map files with no Workshop ID: maps a player
+#              copied into the game's own mod folders by hand, outside Steam.
+ITEM_DIRS=()
+MOD_DIRS=()
 for root in "${STEAM_ROOTS[@]:-}"; do
-    content="$root/steamapps/workshop/content/$APPID"
-    [ -d "$content" ] || continue
-
-    for item in "$content"/*/; do
-        [ -d "$item" ] || continue
-        WORKSHOP_DIRS_SEEN=$((WORKSHOP_DIRS_SEEN + 1))
-        id="$(basename "$item")"
-
-        # Check 2: known-bad Workshop ID
-        for bad in "${BAD_IDS[@]:-}"; do
-            if [ "$id" = "$bad" ]; then
-                finding FOUND "Known malicious Workshop map is installed (ID $id)" "$item"
-            fi
+    [ -n "$root" ] || continue
+    for base in "$root/steamapps/workshop/content/$APPID" \
+                "$root/steamapps/workshop/downloads/$APPID"; do
+        [ -d "$base" ] || continue
+        for item in "$base"/*/; do
+            [ -d "$item" ] && ITEM_DIRS+=("${item%/}")
         done
-
-        # Checks 3 and 4: hash and byte-scan the Unreal asset containers
-        while IFS= read -r -d '' pak; do
-            h="$(sha256sum "$pak" 2>/dev/null | cut -d' ' -f1 | tr 'A-Z' 'a-z')"
-            for bad in "${BAD_HASHES[@]}"; do
-                if [ -n "$h" ] && [ "$h" = "$bad" ]; then
-                    finding FOUND "Map file matches a known malicious file exactly" "$pak"
-                fi
-            done
-            for s in "${BAD_STRINGS[@]}"; do
-                if contains_string "$pak" "$s"; then
-                    finding SUSPICIOUS "Map file contains a known malware marker (\"$s\")" "$pak"
-                    break
-                fi
-            done
-        done < <(find "$item" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
     done
+
+    # The game's install folder name comes from Steam's own manifest rather
+    # than being guessed, so a rename by the developer does not break this.
+    game=""
+    manifest="$root/steamapps/appmanifest_$APPID.acf"
+    if [ -r "$manifest" ]; then
+        installdir="$(grep -oE '"installdir"[[:space:]]+"[^"]+"' "$manifest" \
+                      | sed 's/.*"installdir"[[:space:]]*"//; s/"$//' | head -1)"
+        [ -n "$installdir" ] && game="$root/steamapps/common/$installdir"
+    fi
+    [ -d "$game" ] || continue
+    # Unreal loads mod paks from Content/Paks/~mods, and UE4SS-style loaders
+    # from Content/Paks/LogicMods. Depth 5 covers <Project>/Content/Paks/<dir>.
+    while IFS= read -r -d '' m; do
+        MOD_DIRS+=("$m")
+    done < <(find "$game" -maxdepth 5 -type d \( -iname '~mods' -o -iname 'LogicMods' \) -print0 2>/dev/null)
 done
 
-if [ "$WORKSHOP_DIRS_SEEN" -eq 0 ]; then
+say "${C_BLD}  Checking your Workshop maps...${C_OFF}"
+
+# Checks 3 and 4: hash and byte-scan the Unreal asset containers under a folder.
+scan_map_files() {  # scan_map_files <dir>
+    local pak h bad s
+    while IFS= read -r -d '' pak; do
+        h="$(sha256sum "$pak" 2>/dev/null | cut -d' ' -f1 | tr 'A-Z' 'a-z')"
+        for bad in "${BAD_HASHES[@]}"; do
+            if [ -n "$h" ] && [ "$h" = "$bad" ]; then
+                finding FOUND "Map file matches a known malicious file exactly" "$pak"
+            fi
+        done
+        for s in "${BAD_STRINGS[@]}"; do
+            if contains_string "$pak" "$s"; then
+                finding SUSPICIOUS "Map file contains a known malware marker (\"$s\")" "$pak"
+                break
+            fi
+        done
+    done < <(find "$1" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
+}
+
+for item in "${ITEM_DIRS[@]:-}"; do
+    [ -n "$item" ] || continue
+    id="$(basename "$item")"
+
+    # Check 2: known-bad Workshop ID
+    for bad in "${BAD_IDS[@]:-}"; do
+        if [ "$id" = "$bad" ]; then
+            finding FOUND "Known malicious Workshop map is installed (ID $id)" "$item"
+        fi
+    done
+
+    scan_map_files "$item"
+done
+
+for m in "${MOD_DIRS[@]:-}"; do
+    [ -n "$m" ] && scan_map_files "$m"
+done
+
+if [ "${#ITEM_DIRS[@]}" -eq 0 ] && [ "${#MOD_DIRS[@]}" -eq 0 ]; then
     say "  ${C_GRN}No Meccha Chameleon Workshop maps are installed.${C_OFF}"
 else
-    say "  ${C_DIM}Examined $WORKSHOP_DIRS_SEEN installed map(s).${C_OFF}"
+    say "  ${C_DIM}Examined ${#ITEM_DIRS[@]} Workshop map(s) and ${#MOD_DIRS[@]} mod folder(s).${C_OFF}"
 fi
 say ""
 
@@ -568,9 +610,8 @@ if [ "$DEEP" = 1 ]; then
     # match inside a large binary is not worth frightening anyone over; writing
     # a file AND launching something is a different matter.
     CAP_PAT='getplatformuserdir|savestringtofile|savestringarraytofile|executeconsolecommand|launchurl|createproc|bp_rce|filesavedialog|writestringtofile'
-    for root in "${STEAM_ROOTS[@]:-}"; do
-        content="$root/steamapps/workshop/content/$APPID"
-        [ -d "$content" ] || continue
+    for mapdir in "${ITEM_DIRS[@]:-}" "${MOD_DIRS[@]:-}"; do
+        [ -n "$mapdir" ] || continue
         while IFS= read -r -d '' pak; do
             [ -n "${BEHAV_SEEN[$pak]:-}" ] && continue
             hits="$(LC_ALL=C tr -d '\000' < "$pak" 2>/dev/null | tr 'A-Z' 'a-z' \
@@ -580,7 +621,7 @@ if [ "$DEEP" = 1 ]; then
                 BEHAV_SEEN[$pak]=1
                 note "A map can write files or launch programs, which maps do not need ($(printf '%s' "$hits" | tr '\n' ' '))" "$pak"
             fi
-        done < <(find "$content" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
+        done < <(find "$mapdir" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
     done
 
     # -- B4: evidence that something already ran ----------------------------

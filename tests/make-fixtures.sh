@@ -55,6 +55,20 @@ KNOWN_HASH="$(sha256sum "$WS/7777777777/known.pak" | cut -d' ' -f1)"
 # A perfectly ordinary map, to prove we do not flag everything.
 printf 'a completely normal community map\n' > "$WS/1111111111/clean.pak"
 
+# A partial download Steam has staged but not finished installing. The files
+# are on disk all the same, so they must be checked like an installed map.
+DL="$DIRTY/steamroot/steamapps/workshop/downloads/$APPID/5555555555"
+mkdir -p "$DL"
+{ printf 'PARTIAL\x00'; printf '%s' "$MARK_IP"; printf '\x00'; } > "$DL/partial.pak"
+
+# A map copied by hand into the game's own mod folder, outside Steam. There is
+# no Workshop ID; the install folder is resolved from Steam's app manifest.
+printf '"AppState"\n{\n\t"appid"\t\t"%s"\n\t"installdir"\t\t"Test Game"\n}\n' "$APPID" \
+    > "$DIRTY/steamroot/steamapps/appmanifest_$APPID.acf"
+MODS="$DIRTY/steamroot/steamapps/common/Test Game/TestProject/Content/Paks/~mods"
+mkdir -p "$MODS"
+{ printf 'LOOSE\x00'; printf '%s' "$MARK_IP" | iconv -f ASCII -t UTF-16LE; } > "$MODS/loose.pak"
+
 # The dropped file, in the Proton prefix where it actually lands (check 5).
 cat > "$PFX/Documents/s.bat" <<'EOF'
 @echo off
@@ -135,6 +149,12 @@ has "matches a known malicious file exactly" \
     && ok "check 3  file hash match"              || bad "check 3  file hash match"
 has "Map file contains a known malware marker" \
     && ok "check 4  UTF-16 marker inside .pak"    || bad "check 4  UTF-16 marker inside .pak"
+has "workshop/downloads/$APPID/5555555555/partial.pak" \
+    && ok "check 4  partial download in workshop/downloads" \
+    || bad "check 4  partial download in workshop/downloads"
+has "Content/Paks/~mods/loose.pak" \
+    && ok "check 4  hand-installed map in the game's ~mods folder" \
+    || bad "check 4  hand-installed map in the game's ~mods folder"
 has "where the malware drops its file" \
     && ok "check 5  s.bat in the Proton prefix"   || bad "check 5  s.bat in the Proton prefix"
 has "A script here contains a known malware marker" \

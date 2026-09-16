@@ -61,6 +61,24 @@ $KnownHash = (Get-FileHash -LiteralPath "$Ws\7777777777\known.pak" -Algorithm SH
 # A perfectly ordinary map, to prove we do not flag everything.
 Set-Content -LiteralPath "$Ws\1111111111\clean.pak" -Value 'a completely normal community map'
 
+# A partial download Steam has staged but not finished installing. The files
+# are on disk all the same, so they must be checked like an installed map.
+$Dl = Join-Path $Dirty "steamroot\steamapps\workshop\downloads\$AppId\5555555555"
+New-Item -ItemType Directory -Path $Dl -Force | Out-Null
+[System.IO.File]::WriteAllBytes("$Dl\partial.pak",
+    [System.Text.Encoding]::ASCII.GetBytes("PARTIAL$MarkIp"))
+
+# A map copied by hand into the game's own mod folder, outside Steam. There is
+# no Workshop ID; the install folder is resolved from Steam's app manifest.
+Set-Content -LiteralPath "$Dirty\steamroot\steamapps\appmanifest_$AppId.acf" -Value @(
+    '"AppState"', '{', "`t`"appid`"`t`t`"$AppId`"", "`t`"installdir`"`t`t`"Test Game`"", '}'
+)
+$Mods = Join-Path $Dirty 'steamroot\steamapps\common\Test Game\TestProject\Content\Paks\~mods'
+New-Item -ItemType Directory -Path $Mods -Force | Out-Null
+[System.IO.File]::WriteAllBytes("$Mods\loose.pak", ([byte[]]@() `
+    + [System.Text.Encoding]::ASCII.GetBytes('LOOSE') `
+    + [System.Text.Encoding]::Unicode.GetBytes($MarkIp)))
+
 # The dropped file, in Documents where the malware writes it (check 5).
 Set-Content -LiteralPath "$Dirty\home\Documents\s.bat" -Value @(
     '@echo off',
@@ -138,7 +156,9 @@ Write-Host ''
 Check ($OutDirty -match 'Known malicious Workshop map is installed \(ID 3765145606\)') 'check 2  known-bad Workshop ID'
 Check ($OutDirty -match 'matches a known malicious file exactly')                      'check 3  file hash match'
 Check ($OutDirty -match 'Map file contains a known malware marker')                    'check 4  UTF-16 marker inside .pak'
-Check ($OutDirty -match 'where the malware drops its file')                            'check 5  s.bat in Documents'
+Check ($OutDirty -match "workshop\\downloads\\$AppId\\5555555555\\partial\.pak")    'check 4  partial download in workshop\downloads'
+Check ($OutDirty -match 'Content\\Paks\\~mods\\loose\.pak')                          "check 4  hand-installed map in the game's ~mods folder"
+Check ($OutDirty -match 'where the malware drops its file')                          'check 5  s.bat in Documents'
 Check ($OutDirty -match 'A script here contains a known malware marker')               'check 5b renamed .cmd variant'
 Check ($OutDirty -match 'A startup file refers to the malware')                        'check 6  Startup folder persistence'
 Check ($OutDirty -match 'This tool has changed nothing')                               'states that nothing was modified'

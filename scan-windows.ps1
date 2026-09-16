@@ -241,41 +241,79 @@ if ($SteamRoots.Count -eq 0) {
 
 # ----------------------------------------------- checks 2+3+4: workshop maps
 
-Say '  Checking your subscribed Workshop maps...' 'White'
-
-$mapsSeen = 0
+# Every place a map can sit on disk, gathered once so the IOC checks and the
+# -Deep capability check always examine the same set.
+#
+#   ItemDirs  one folder per Workshop item, named by its Workshop ID. Both the
+#             finished install (content\) and Steam's staging area for an
+#             interrupted or in-progress download (downloads\) -- a partial
+#             download is still a malicious file on disk.
+#   ModDirs   folders of loose map files with no Workshop ID: maps a player
+#             copied into the game's own mod folders by hand, outside Steam.
+$ItemDirs = New-Object System.Collections.Generic.List[string]
+$ModDirs  = New-Object System.Collections.Generic.List[string]
 foreach ($root in $SteamRoots) {
-    $content = Join-Path $root "steamapps\workshop\content\$AppId"
-    if (-not (Test-Path -LiteralPath $content)) { continue }
-
-    foreach ($item in (Get-ChildItem -LiteralPath $content -Directory -ErrorAction SilentlyContinue)) {
-        $mapsSeen++
-
-        # Check 2: known-bad Workshop ID
-        if ($BadIds -contains $item.Name) {
-            Add-Finding FOUND "Known malicious Workshop map is installed (ID $($item.Name))" $item.FullName
+    foreach ($base in @("steamapps\workshop\content\$AppId", "steamapps\workshop\downloads\$AppId")) {
+        $p = Join-Path $root $base
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        foreach ($item in (Get-ChildItem -LiteralPath $p -Directory -ErrorAction SilentlyContinue)) {
+            $ItemDirs.Add($item.FullName)
         }
+    }
 
-        # Checks 3 and 4: hash and scan the Unreal asset containers
-        $paks = Get-ChildItem -LiteralPath $item.FullName -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '^\.(pak|utoc|ucas)$' }
-        foreach ($pak in $paks) {
-            try {
-                $h = (Get-FileHash -LiteralPath $pak.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
-                if ($BadHashes -contains $h) {
-                    Add-Finding FOUND 'Map file matches a known malicious file exactly' $pak.FullName
-                }
-            } catch { }
-            $hit = Test-ContainsMarker -Path $pak.FullName -Markers $BadStrings
-            if ($hit) {
-                Add-Finding SUSPICIOUS "Map file contains a known malware marker (`"$hit`")" $pak.FullName
+    # The game's install folder name comes from Steam's own manifest rather
+    # than being guessed, so a rename by the developer does not break this.
+    $manifest = Join-Path $root "steamapps\appmanifest_$AppId.acf"
+    if (-not (Test-Path -LiteralPath $manifest)) { continue }
+    $installDir = $null
+    foreach ($line in (Get-Content -LiteralPath $manifest -ErrorAction SilentlyContinue)) {
+        if ($line -match '"installdir"\s+"([^"]+)"') { $installDir = $Matches[1]; break }
+    }
+    if (-not $installDir) { continue }
+    $game = Join-Path $root "steamapps\common\$installDir"
+    if (-not (Test-Path -LiteralPath $game)) { continue }
+    # Unreal loads mod paks from Content\Paks\~mods, and UE4SS-style loaders
+    # from Content\Paks\LogicMods. Depth 4 covers <Project>\Content\Paks\<dir>.
+    Get-ChildItem -LiteralPath $game -Directory -Recurse -Depth 4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -in @('~mods', 'LogicMods') } |
+        ForEach-Object { $ModDirs.Add($_.FullName) }
+}
+
+function Get-MapFiles {
+    param([string]$Dir)
+    Get-ChildItem -LiteralPath $Dir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -match '^\.(pak|utoc|ucas)$' }
+}
+
+Say '  Checking your Workshop maps...' 'White'
+
+foreach ($dir in @($ItemDirs) + @($ModDirs)) {
+    # Check 2: known-bad Workshop ID. Loose mod folders have no ID to check.
+    $name = Split-Path -Leaf $dir
+    if ($ItemDirs -contains $dir -and $BadIds -contains $name) {
+        Add-Finding FOUND "Known malicious Workshop map is installed (ID $name)" $dir
+    }
+
+    # Checks 3 and 4: hash and scan the Unreal asset containers
+    foreach ($pak in (Get-MapFiles -Dir $dir)) {
+        try {
+            $h = (Get-FileHash -LiteralPath $pak.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+            if ($BadHashes -contains $h) {
+                Add-Finding FOUND 'Map file matches a known malicious file exactly' $pak.FullName
             }
+        } catch { }
+        $hit = Test-ContainsMarker -Path $pak.FullName -Markers $BadStrings
+        if ($hit) {
+            Add-Finding SUSPICIOUS "Map file contains a known malware marker (`"$hit`")" $pak.FullName
         }
     }
 }
 
-if ($mapsSeen -eq 0) { Say '  No Meccha Chameleon Workshop maps are installed.' 'Green' }
-else                 { Say "  Examined $mapsSeen installed map(s)." 'DarkGray' }
+if ($ItemDirs.Count -eq 0 -and $ModDirs.Count -eq 0) {
+    Say '  No Meccha Chameleon Workshop maps are installed.' 'Green'
+} else {
+    Say "  Examined $($ItemDirs.Count) Workshop map(s) and $($ModDirs.Count) mod folder(s)." 'DarkGray'
+}
 Say ''
 
 # ------------------------------------------------------ check 5: dropped s.bat
@@ -537,12 +575,8 @@ if ($Deep) {
     $capMarkers = @('GetPlatformUserDir','SaveStringToFile','SaveStringArrayToFile',
                     'ExecuteConsoleCommand','LaunchURL','CreateProc','BP_RCE',
                     'WriteStringToFile','FileSaveDialog')
-    foreach ($root in $SteamRoots) {
-        $content = Join-Path $root "steamapps\workshop\content\$AppId"
-        if (-not (Test-Path -LiteralPath $content)) { continue }
-        $paks = Get-ChildItem -LiteralPath $content -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '^\.(pak|utoc|ucas)$' }
-        foreach ($pak in $paks) {
+    foreach ($dir in @($ItemDirs) + @($ModDirs)) {
+        foreach ($pak in (Get-MapFiles -Dir $dir)) {
             $found = @()
             foreach ($m in $capMarkers) {
                 if (Test-ContainsMarker -Path $pak.FullName -Markers @($m)) { $found += $m }

@@ -64,7 +64,7 @@ native scanners rather than one cross-platform program, and why the bash side pa
 | # | Check | Mechanism |
 |---|---|---|
 | 1 | Locate Steam | Registry / known paths → `libraryfolders.vdf` → **enumerate every drive** |
-| 2 | Known-bad Workshop IDs | Directory-name match under `steamapps/workshop/content/4704690/` |
+| 2 | Known-bad Workshop IDs | Directory-name match under `steamapps/workshop/content/4704690/` and `workshop/downloads/4704690/` |
 | 3 | File hashes | SHA256 of every `.pak`/`.utoc`/`.ucas` |
 | 4 | Markers inside archives | Byte scan, ASCII **and** UTF-16LE |
 | 5 | Dropped file | `s.bat` by hash and name, plus renamed `.bat`/`.cmd` carrying a marker |
@@ -77,6 +77,18 @@ whole-machine scan took **64 seconds**; with it, **~3 seconds**.
 
 Check 4 strips `NUL` bytes before matching, which turns UTF-16LE into ASCII, so one pass covers both
 encodings — Unreal string literals are commonly UTF-16.
+
+Checks 3 and 4 (and the `--deep` capability check) run over every place a map can sit on disk, not
+just the subscribed install:
+
+| Location | Why |
+|---|---|
+| `steamapps/workshop/content/<appid>/<id>/` | Installed Workshop maps |
+| `steamapps/workshop/downloads/<appid>/<id>/` | Interrupted or in-progress downloads — still malicious files on disk |
+| `steamapps/common/<installdir>/**/Content/Paks/~mods/` and `LogicMods/` | Maps copied in by hand, outside Steam. `<installdir>` is read from `appmanifest_<appid>.acf`, not guessed |
+
+`steamcmd` installs are found by the same library search: `~/Steam` is a known location on Linux, and
+on Windows the drive sweep reaches wherever it was extracted.
 
 ### Behaviour checks (`--deep`)
 
@@ -264,12 +276,12 @@ Exact SHA256 breaks on any recompile. ssdeep or TLSH over `.pak` files would sur
 repackaging and cluster related samples. Adds a dependency, so it'd need to be optional — which cuts
 against the zero-dependency rule, hence not done yet.
 
-### 6. Workshop content only in the subscribed path — *easy*
+### 6. Unconfirmed map locations — *easy, needs someone with the setup*
 
-Only `steamapps/workshop/content/<appid>/` is examined. Not covered: `workshop/downloads/` (partial
-downloads), legacy `ugc/` paths, `steamcmd`-based installs, and manually extracted maps sitting in
-the game's own `Content/Paks/~mods` folder. Straightforward to add; just needs someone with those
-setups to confirm the real paths.
+Partial downloads, hand-installed `~mods`/`LogicMods` maps and `steamcmd` libraries are now covered
+(see [the checks](#ioc-checks-default)). Still not covered: legacy `ugc/` paths, and any mod folder
+name other than those two. If the game's own mod loader reads from somewhere else, the scan won't
+look there. What's needed is someone with that setup to confirm the real path.
 
 ### 6b. Behaviour rules cover scripts, not binaries — *medium*
 

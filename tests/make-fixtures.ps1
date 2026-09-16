@@ -203,10 +203,13 @@ function Invoke-JsonScan {
     $out = Get-Content -LiteralPath (Join-Path $Fix 'json.out') -Raw -Encoding UTF8
     $obj = $null
     $err = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
-    try { $obj = $out | ConvertFrom-Json -ErrorAction Stop } catch {
-        # A parse failure is otherwise just "FAIL" with no clue why. Show what
-        # the scanner actually produced.
-        Write-Host "  (-Json output did not parse: $($_.Exception.Message))" -ForegroundColor Yellow
+    $why = $null
+    if ([string]::IsNullOrWhiteSpace($out)) { $why = 'stdout was empty' }
+    else { try { $obj = $out | ConvertFrom-Json -ErrorAction Stop } catch { $why = $_.Exception.Message } }
+    if ($why) {
+        # Otherwise this is just "FAIL" with no clue why. Show what the scanner
+        # actually produced.
+        Write-Host "  (-Json output did not parse: $why)" -ForegroundColor Yellow
         Write-Host "  rc=$($p.ExitCode) stdout: $("$out".Substring(0, [Math]::Min(600, "$out".Length)))"
         $errTail = "$err"; if ($errTail.Length -gt 1500) { $errTail = $errTail.Substring($errTail.Length - 1500) }
         Write-Host "  stderr tail: $errTail"

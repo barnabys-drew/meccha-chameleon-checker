@@ -75,7 +75,7 @@ function Stop-Scan {
 
 function Add-Finding {
     param([ValidateSet('FOUND','SUSPICIOUS')][string]$Severity, [string]$What, [string]$Where)
-    $script:Findings.Add([ordered]@{ severity = $Severity; what = $What; where = $Where })
+    $script:Findings.Add([pscustomobject]@{ severity = $Severity; what = $What; where = $Where })
     if ($Severity -eq 'FOUND') {
         $script:FoundCount++
         Say "  [FOUND]      $What" 'Red'
@@ -93,7 +93,7 @@ function Add-Finding {
 function Add-Note {
     param([string]$What, [string]$Where)
     $script:NoteCount++
-    $script:Findings.Add([ordered]@{ severity = 'WORTH_A_LOOK'; what = $What; where = $Where })
+    $script:Findings.Add([pscustomobject]@{ severity = 'WORTH_A_LOOK'; what = $What; where = $Where })
     Say "  [WORTH A LOOK] $What" 'Cyan'
     Say "                 $Where" 'DarkGray'
 }
@@ -803,28 +803,40 @@ try {
 # "schema". Arrays go through @() so a single entry is never unwrapped into a
 # bare object.
 if ($Json) {
-    $result = [ordered]@{
-        schema             = 1
-        tool               = 'meccha-chameleon-checker'
-        platform           = 'windows'
-        host               = $env:COMPUTERNAME
-        scan_date          = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        indicators_updated = [string]$ioc.updated
-        deep               = [bool]$Deep
-        exit_code          = $exitCode
-        verdict            = $verdict
-        counts             = [ordered]@{
-            found        = $script:FoundCount
-            suspicious   = $script:SuspectCount
-            worth_a_look = $script:NoteCount
+    try {
+        $result = [pscustomobject]@{
+            schema             = 1
+            tool               = 'meccha-chameleon-checker'
+            platform           = 'windows'
+            host               = [string]$env:COMPUTERNAME
+            scan_date          = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            indicators_updated = [string]$ioc.updated
+            deep               = [bool]$Deep
+            exit_code          = [int]$exitCode
+            verdict            = $verdict
+            counts             = [pscustomobject]@{
+                found        = [int]$script:FoundCount
+                suspicious   = [int]$script:SuspectCount
+                worth_a_look = [int]$script:NoteCount
+            }
+            findings           = [object[]]@($script:Findings)
+            context_files      = [string[]]@($script:InfoLines)
+            steam_libraries    = [string[]]@($SteamRoots)
+            report_file        = $reportFile
+            caveat             = $caveat
         }
-        findings           = @($script:Findings)
-        context_files      = @($script:InfoLines)
-        steam_libraries    = @($SteamRoots)
-        report_file        = $reportFile
-        caveat             = $caveat
+        [Console]::Out.WriteLine((ConvertTo-Json -InputObject $result -Depth 5 -Compress))
+    } catch {
+        # Never leave stdout empty: a sweep must be able to tell "this machine's
+        # result could not be produced" from "this machine was never scanned".
+        [Console]::Error.WriteLine("ERROR: could not build the JSON result: $($_.Exception.Message)")
+        [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject ([ordered]@{
+            schema = 1; tool = 'meccha-chameleon-checker'; platform = 'windows'
+            host = $env:COMPUTERNAME; exit_code = 2; verdict = 'scan_failed'
+            error = "could not build the JSON result: $($_.Exception.Message)"
+        })))
+        exit 2
     }
-    [Console]::Out.WriteLine((ConvertTo-Json -InputObject $result -Depth 5 -Compress))
 }
 
 exit $exitCode

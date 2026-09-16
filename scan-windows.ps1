@@ -59,23 +59,48 @@ function Say {
     Show $Text $Color
 }
 
+# One JSON value, written by hand. Windows PowerShell 5.1's ConvertTo-Json
+# throws "Argument types do not match" on some of the arrays this result
+# carries, so it is not used at all. Paths are the only untrusted text, and a
+# filename can contain backslashes and characters JSON must escape.
+function ConvertTo-JsonText {
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
+    if ($Value -is [int]) { return [string]$Value }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($c in ([string]$Value).ToCharArray()) {
+        if     ($c -eq [char]'"')  { [void]$sb.Append('\"') }
+        elseif ($c -eq [char]'\')  { [void]$sb.Append('\\') }
+        elseif ([int]$c -lt 0x20)  { [void]$sb.Append(('\u{0:x4}' -f [int]$c)) }
+        else                       { [void]$sb.Append($c) }
+    }
+    [void]$sb.Append('"')
+    $sb.ToString()
+}
+
+function ConvertTo-JsonArray {
+    param($Items)
+    '[' + ((@($Items) | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-JsonText $_ }) -join ',') + ']'
+}
+
 # Exit 2 -- the scan could not run. Under -Json this still prints a result, so
 # a sweep of many machines records "failed" rather than silently skipping one.
 function Stop-Scan {
     param([string[]]$Lines)
     foreach ($l in $Lines) { [Console]::Error.WriteLine("ERROR: $l") }
     if ($Json) {
-        [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject ([ordered]@{
-            schema = 1; tool = 'meccha-chameleon-checker'; platform = 'windows'
-            host = $env:COMPUTERNAME; exit_code = 2; verdict = 'scan_failed'; error = $Lines[0]
-        })))
+        [Console]::Out.WriteLine('{"schema":1,"tool":"meccha-chameleon-checker","platform":"windows"' +
+            ',"host":' + (ConvertTo-JsonText $env:COMPUTERNAME) +
+            ',"exit_code":2,"verdict":"scan_failed","error":' + (ConvertTo-JsonText $Lines[0]) + '}')
     }
     exit 2
 }
 
 function Add-Finding {
     param([ValidateSet('FOUND','SUSPICIOUS')][string]$Severity, [string]$What, [string]$Where)
-    $script:Findings.Add([pscustomobject]@{ severity = $Severity; what = $What; where = $Where })
+    $script:Findings.Add([pscustomobject]@{ severity = $Severity; what = $What; location = $Where })
     if ($Severity -eq 'FOUND') {
         $script:FoundCount++
         Say "  [FOUND]      $What" 'Red'
@@ -93,7 +118,7 @@ function Add-Finding {
 function Add-Note {
     param([string]$What, [string]$Where)
     $script:NoteCount++
-    $script:Findings.Add([pscustomobject]@{ severity = 'WORTH_A_LOOK'; what = $What; where = $Where })
+    $script:Findings.Add([pscustomobject]@{ severity = 'WORTH_A_LOOK'; what = $What; location = $Where })
     Say "  [WORTH A LOOK] $What" 'Cyan'
     Say "                 $Where" 'DarkGray'
 }
@@ -800,42 +825,35 @@ try {
 #
 # The schema is documented in docs/HOW-IT-WORKS.md and is a promise: fleet
 # scripts parse it. Add fields freely; renaming or removing one means bumping
-# "schema". Arrays go through @() so a single entry is never unwrapped into a
-# bare object.
+# "schema".
 if ($Json) {
     try {
-        $result = [pscustomobject]@{
-            schema             = 1
-            tool               = 'meccha-chameleon-checker'
-            platform           = 'windows'
-            host               = [string]$env:COMPUTERNAME
-            scan_date          = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-            indicators_updated = [string]$ioc.updated
-            deep               = [bool]$Deep
-            exit_code          = [int]$exitCode
-            verdict            = $verdict
-            counts             = [pscustomobject]@{
-                found        = [int]$script:FoundCount
-                suspicious   = [int]$script:SuspectCount
-                worth_a_look = [int]$script:NoteCount
-            }
-            findings           = [object[]]@($script:Findings)
-            context_files      = [string[]]@($script:InfoLines)
-            steam_libraries    = [string[]]@($SteamRoots)
-            report_file        = $reportFile
-            caveat             = $caveat
-        }
-        [Console]::Out.WriteLine((ConvertTo-Json -InputObject $result -Depth 5 -Compress))
+        $findingsJson = @($script:Findings | ForEach-Object {
+            '{"severity":' + (ConvertTo-JsonText $_.severity) +
+            ',"what":'     + (ConvertTo-JsonText $_.what) +
+            ',"where":'    + (ConvertTo-JsonText $_.location) + '}'
+        }) -join ','
+        $j = New-Object System.Text.StringBuilder
+        [void]$j.Append('{"schema":1,"tool":"meccha-chameleon-checker","platform":"windows"')
+        [void]$j.Append(',"host":'               + (ConvertTo-JsonText ([string]$env:COMPUTERNAME)))
+        [void]$j.Append(',"scan_date":'          + (ConvertTo-JsonText ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))))
+        [void]$j.Append(',"indicators_updated":' + (ConvertTo-JsonText ([string]$ioc.updated)))
+        [void]$j.Append(',"deep":'               + (ConvertTo-JsonText ([bool]$Deep)))
+        [void]$j.Append(',"exit_code":'          + (ConvertTo-JsonText ([int]$exitCode)))
+        [void]$j.Append(',"verdict":'            + (ConvertTo-JsonText $verdict))
+        [void]$j.Append(',"counts":{"found":' + [int]$script:FoundCount +
+                        ',"suspicious":' + [int]$script:SuspectCount +
+                        ',"worth_a_look":' + [int]$script:NoteCount + '}')
+        [void]$j.Append(',"findings":['         + $findingsJson + ']')
+        [void]$j.Append(',"context_files":'     + (ConvertTo-JsonArray $script:InfoLines))
+        [void]$j.Append(',"steam_libraries":'   + (ConvertTo-JsonArray $SteamRoots))
+        [void]$j.Append(',"report_file":'       + (ConvertTo-JsonText $reportFile))
+        [void]$j.Append(',"caveat":'            + (ConvertTo-JsonText $caveat) + '}')
+        [Console]::Out.WriteLine($j.ToString())
     } catch {
         # Never leave stdout empty: a sweep must be able to tell "this machine's
         # result could not be produced" from "this machine was never scanned".
-        [Console]::Error.WriteLine("ERROR: could not build the JSON result: $($_.Exception.Message)")
-        [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject ([ordered]@{
-            schema = 1; tool = 'meccha-chameleon-checker'; platform = 'windows'
-            host = $env:COMPUTERNAME; exit_code = 2; verdict = 'scan_failed'
-            error = "could not build the JSON result: $($_.Exception.Message)"
-        })))
-        exit 2
+        Stop-Scan "could not build the JSON result: $($_.Exception.Message)"
     }
 }
 

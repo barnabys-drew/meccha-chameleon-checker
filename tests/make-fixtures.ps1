@@ -202,9 +202,16 @@ function Invoke-JsonScan {
             -ArgumentList (@('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$Scanner`"",'-Json') + $ScanArgs)
     $out = Get-Content -LiteralPath (Join-Path $Fix 'json.out') -Raw -Encoding UTF8
     $obj = $null
-    try { $obj = $out | ConvertFrom-Json -ErrorAction Stop } catch { }
-    [pscustomobject]@{ Rc = $p.ExitCode; Out = $out; Obj = $obj
-                       Err = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue) }
+    $err = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
+    try { $obj = $out | ConvertFrom-Json -ErrorAction Stop } catch {
+        # A parse failure is otherwise just "FAIL" with no clue why. Show what
+        # the scanner actually produced.
+        Write-Host "  (-Json output did not parse: $($_.Exception.Message))" -ForegroundColor Yellow
+        Write-Host "  rc=$($p.ExitCode) stdout: $("$out".Substring(0, [Math]::Min(600, "$out".Length)))"
+        $errTail = "$err"; if ($errTail.Length -gt 1500) { $errTail = $errTail.Substring($errTail.Length - 1500) }
+        Write-Host "  stderr tail: $errTail"
+    }
+    [pscustomobject]@{ Rc = $p.ExitCode; Out = $out; Obj = $obj; Err = $err }
 }
 
 $J = Invoke-JsonScan @('-ScanRoot', "`"$Dirty`"", '-Indicators', "`"$TestIoc`"")

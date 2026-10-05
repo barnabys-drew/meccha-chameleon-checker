@@ -62,6 +62,10 @@ So the agent hunts, in descending order of durability:
 
 A finding at priority 1 or 2 is worth more than ten at priority 4.
 
+Priority 1 findings usually cannot be expressed as a line in `indicators.json` — a capability is not
+a string to match. They are recorded in [TECHNIQUES.md](TECHNIQUES.md) instead, together with what
+the scanners would have to do to cover them.
+
 ## Sources the agent checks
 
 - The original analysis: [Feint's writeup](https://medium.com/@FeintBE/workshop-map-for-meccha-chameleon-is-a-malware-dropper-full-breakdown-d1ac29565265)

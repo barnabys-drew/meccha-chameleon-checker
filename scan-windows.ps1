@@ -16,7 +16,9 @@ param(
     [string]$Indicators,
     [switch]$NoColor,
     [switch]$Deep,
-    [Alias('Json')][switch]$JsonOutput
+    # One machine-readable JSON result on stdout, for checking many computers
+    # at once. The normal report still appears, on stderr.
+    [switch]$Json
 )
 
 $ErrorActionPreference = 'Continue'
@@ -44,19 +46,75 @@ function Write-JsonError {
     } else { Write-Error $Message }
 }
 
-function Say {
+$script:Findings     = New-Object System.Collections.Generic.List[object]
+
+# JSON is UTF-8 by definition, but Windows PowerShell 5.1 writes redirected
+# stdout in the OEM code page, which mangles any non-ASCII path. Some hosts
+# have no console to reconfigure; the output is still usable then, just not
+# guaranteed for non-ASCII names.
+if ($Json) {
+    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+}
+
+# Everything a person reads goes through Show. With -Json it goes to stderr,
+# so stdout carries exactly one JSON document and nothing else -- a stray
+# progress line would make every result unparseable.
+function Show {
     param([string]$Text, [string]$Color)
-    $script:ReportLines.Add($Text)
-    if ($JsonOutput) { [Console]::Error.WriteLine($Text) }
+    if ($Json) { [Console]::Error.WriteLine($Text) }
     elseif ($NoColor -or -not $Color) { Write-Host $Text }
     else { Write-Host $Text -ForegroundColor $Color }
 }
 
+# Shown, and captured for the report file.
+function Say {
+    param([string]$Text, [string]$Color)
+    $script:ReportLines.Add($Text)
+    Show $Text $Color
+}
+
+# One JSON value, written by hand. Windows PowerShell 5.1's ConvertTo-Json
+# throws "Argument types do not match" on some of the arrays this result
+# carries, so it is not used at all. Paths are the only untrusted text, and a
+# filename can contain backslashes and characters JSON must escape.
+function ConvertTo-JsonText {
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
+    if ($Value -is [int]) { return [string]$Value }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($c in ([string]$Value).ToCharArray()) {
+        if     ($c -eq [char]'"')  { [void]$sb.Append('\"') }
+        elseif ($c -eq [char]'\')  { [void]$sb.Append('\\') }
+        elseif ([int]$c -lt 0x20)  { [void]$sb.Append(('\u{0:x4}' -f [int]$c)) }
+        else                       { [void]$sb.Append($c) }
+    }
+    [void]$sb.Append('"')
+    $sb.ToString()
+}
+
+function ConvertTo-JsonArray {
+    param($Items)
+    '[' + ((@($Items) | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-JsonText $_ }) -join ',') + ']'
+}
+
+# Exit 2 -- the scan could not run. Under -Json this still prints a result, so
+# a sweep of many machines records "failed" rather than silently skipping one.
+function Stop-Scan {
+    param([string[]]$Lines)
+    foreach ($l in $Lines) { [Console]::Error.WriteLine("ERROR: $l") }
+    if ($Json) {
+        [Console]::Out.WriteLine('{"schema":1,"tool":"meccha-chameleon-checker","platform":"windows"' +
+            ',"host":' + (ConvertTo-JsonText $env:COMPUTERNAME) +
+            ',"exit_code":2,"verdict":"scan_failed","error":' + (ConvertTo-JsonText $Lines[0]) + '}')
+    }
+    exit 2
+}
+
 function Add-Finding {
-    param([ValidateSet('FOUND','SUSPICIOUS')][string]$Severity, [string]$What, [string]$Where, [string]$Check = 'indicator')
-    $script:JsonFindings.Add([pscustomobject]@{
-        severity = $Severity.ToLower(); check = $Check; message = $What; path = $Where
-    })
+    param([ValidateSet('FOUND','SUSPICIOUS')][string]$Severity, [string]$What, [string]$Where)
+    $script:Findings.Add([pscustomobject]@{ severity = $Severity; what = $What; location = $Where })
     if ($Severity -eq 'FOUND') {
         $script:FoundCount++
         Say "  [FOUND]      $What" 'Red'
@@ -77,6 +135,7 @@ function Add-Note {
         severity = 'note'; check = $Check; message = $What; path = $Where
     })
     $script:NoteCount++
+    $script:Findings.Add([pscustomobject]@{ severity = 'WORTH_A_LOOK'; what = $What; location = $Where })
     Say "  [WORTH A LOOK] $What" 'Cyan'
     Say "                 $Where" 'DarkGray'
 }
@@ -95,14 +154,12 @@ function Add-Info { param([string]$Path) $script:InfoLines.Add($Path) }
 # machine, which is the single worst thing this tool could do.
 
 if (-not (Test-Path -LiteralPath $Indicators)) {
-    Write-JsonError "Cannot read indicators file: $Indicators"
-    exit 2
+    Stop-Scan "Cannot read indicators file: $Indicators"
 }
 try {
     $ioc = Get-Content -LiteralPath $Indicators -Raw -ErrorAction Stop | ConvertFrom-Json
 } catch {
-    Write-JsonError "Could not parse $Indicators -- refusing to report a misleading 'clean' result."
-    exit 2
+    Stop-Scan "Could not parse $Indicators -- refusing to report a misleading 'clean' result."
 }
 
 $AppId       = [string]$ioc.steam_appid
@@ -112,8 +169,7 @@ $BadStrings  = @($ioc.content_strings)
 $DropNames   = @($ioc.dropped_filenames)
 
 if (-not $AppId -or $BadHashes.Count -eq 0 -or $BadStrings.Count -eq 0) {
-    Write-JsonError "Indicator file is missing required fields -- refusing to report a misleading 'clean' result."
-    exit 2
+    Stop-Scan "Indicator file is missing required fields -- refusing to report a misleading 'clean' result."
 }
 
 # Does a file contain a marker, as plain text or as UTF-16?
@@ -140,6 +196,91 @@ function Test-ContainsMarker {
         }
     } catch { return $null } finally { $fs.Dispose() }
     return $null
+}
+
+# What a byte search can't see.
+#
+# Checks 4 and B3 search a map file's raw bytes. That only works when the data
+# is stored as-is. Unreal usually compresses it -- UE5 defaults to Oodle, which
+# is proprietary and compiled into each game, so no zero-dependency tool can
+# undo it -- and can encrypt it with a key only the game has. In either case a
+# marker inside is invisible, and the search would quietly say "not found".
+#
+# This reads only the container's header or footer and never decompresses
+# anything. It returns why the raw bytes cannot be searched, or $null if they
+# can. The layouts below were checked against shipping UE5 games.
+function Get-ContainerBlindReason {
+    param([string]$Path)
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    # A .ucas holds the data; its .utoc next to it says how it is stored.
+    if ($ext -eq '.ucas') {
+        $Path = [System.IO.Path]::ChangeExtension($Path, '.utoc')
+        $ext  = '.utoc'
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    }
+    if ($ext -ne '.utoc' -and $ext -ne '.pak') { return $null }
+
+    $fs = $null
+    try {
+        $fs   = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        $br   = New-Object System.IO.BinaryReader $fs
+        $size = $fs.Length
+
+        $readNames = {
+            param([long]$Offset, [long]$Count)
+            $names = @()
+            for ($i = 0; $i -lt [Math]::Min($Count, 8); $i++) {
+                if ($Offset + ($i + 1) * 32 -gt $size) { break }
+                [void]$fs.Seek($Offset + $i * 32, 'Begin')
+                $n = ([System.Text.Encoding]::ASCII.GetString($br.ReadBytes(32)) -replace '[^A-Za-z0-9_]', '')
+                if ($n) { $names += $n }
+            }
+            $names -join ', '
+        }
+
+        if ($ext -eq '.utoc') {
+            # FIoStoreTocHeader, 144 bytes, starting with a 16-byte magic.
+            if ($size -lt 144) { return $null }
+            if ([System.Text.Encoding]::ASCII.GetString($br.ReadBytes(16)) -ne '-==--==--==--==-') { return $null }
+            [void]$fs.Seek(20, 'Begin')
+            $hdr = $br.ReadUInt32(); $entries = $br.ReadUInt32(); $blocks = $br.ReadUInt32()
+            $bsize = $br.ReadUInt32(); $nmeth = $br.ReadUInt32(); $nlen = $br.ReadUInt32()
+            [void]$fs.Seek(80, 'Begin'); $flags = $br.ReadByte()
+            [void]$fs.Seek(84, 'Begin'); $seeds = $br.ReadUInt32()
+            [void]$fs.Seek(96, 'Begin'); $nophash = $br.ReadUInt32()
+            if ($flags -band 2) { return 'encrypted' }
+            if ($nmeth -eq 0) { return $null }
+            # Method names follow the header, the chunk ID (12 bytes) and offset
+            # (10 bytes) tables, the perfect-hash tables and the block table.
+            $off = [long]$hdr + [long]$entries * 22 + [long]$seeds * 4 + [long]$nophash * 4 + [long]$blocks * $bsize
+            $names = if ($nlen -eq 32) { & $readNames $off $nmeth } else { '' }
+            if ($names) { return "compressed with $names" } else { return 'compressed' }
+        }
+
+        # FPakInfo footer: magic E1 12 6F 5A, a fixed distance from the end that
+        # depends on the pak version, then compression method names running to
+        # end of file. The byte before the magic flags an encrypted index.
+        foreach ($pos in 204, 205, 172, 44) {
+            if ($size -lt $pos) { continue }
+            [void]$fs.Seek($size - $pos, 'Begin')
+            if ($br.ReadUInt32() -ne 0x5A6F12E1) { continue }
+            $ver = $br.ReadUInt32()
+            if ($pos -ne 44) {
+                [void]$fs.Seek($size - $pos - 1, 'Begin')
+                if ($br.ReadByte() -eq 1) { return 'encrypted' }
+            }
+            $off = $size - $pos + 44
+            if ($ver -eq 9) { $off++ }
+            $names = & $readNames $off ([Math]::Floor(($size - $off) / 32))
+            if ($names) { return "compressed with $names" }
+            return $null
+        }
+        return $null
+    } catch {
+        return $null
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
 }
 
 # Bounded breadth-first hunt for a "steamapps" folder, returning its parent.
@@ -237,7 +378,7 @@ if ($Synthetic) {
                     Where-Object { $_.DriveType -in 2,3,4,6 } | ForEach-Object { "$($_.DeviceID)\" })
     } catch { }
     $drives = $drives | Sort-Object -Unique
-    Say '  Searching all drives for Steam libraries...' 'DarkGray'
+    Show '  Searching all drives for Steam libraries...' 'DarkGray'
 
     foreach ($dr in $drives) {
         foreach ($sub in @('SteamLibrary','Steam','Games\SteamLibrary','Games\Steam',
@@ -263,41 +404,99 @@ if ($SteamRoots.Count -eq 0) {
 
 # ----------------------------------------------- checks 2+3+4: workshop maps
 
-Say '  Checking your subscribed Workshop maps...' 'White'
-
-$mapsSeen = 0
+# Every place a map can sit on disk, gathered once so the IOC checks and the
+# -Deep capability check always examine the same set.
+#
+#   ItemDirs  one folder per Workshop item, named by its Workshop ID. Both the
+#             finished install (content\) and Steam's staging area for an
+#             interrupted or in-progress download (downloads\) -- a partial
+#             download is still a malicious file on disk.
+#   ModDirs   folders of loose map files with no Workshop ID: maps a player
+#             copied into the game's own mod folders by hand, outside Steam.
+$ItemDirs = New-Object System.Collections.Generic.List[string]
+$ModDirs  = New-Object System.Collections.Generic.List[string]
 foreach ($root in $SteamRoots) {
-    $content = Join-Path $root "steamapps\workshop\content\$AppId"
-    if (-not (Test-Path -LiteralPath $content)) { continue }
-
-    foreach ($item in (Get-ChildItem -LiteralPath $content -Directory -ErrorAction SilentlyContinue)) {
-        $mapsSeen++
-
-        # Check 2: known-bad Workshop ID
-        if ($BadIds -contains $item.Name) {
-            Add-Finding FOUND "Known malicious Workshop map is installed (ID $($item.Name))" $item.FullName
+    foreach ($base in @("steamapps\workshop\content\$AppId", "steamapps\workshop\downloads\$AppId")) {
+        $p = Join-Path $root $base
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        foreach ($item in (Get-ChildItem -LiteralPath $p -Directory -ErrorAction SilentlyContinue)) {
+            $ItemDirs.Add($item.FullName)
         }
+    }
 
-        # Checks 3 and 4: hash and scan the Unreal asset containers
-        $paks = Get-ChildItem -LiteralPath $item.FullName -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '^\.(pak|utoc|ucas)$' }
-        foreach ($pak in $paks) {
-            try {
-                $h = (Get-FileHash -LiteralPath $pak.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
-                if ($BadHashes -contains $h) {
-                    Add-Finding FOUND 'Map file matches a known malicious file exactly' $pak.FullName
-                }
-            } catch { }
-            $hit = Test-ContainsMarker -Path $pak.FullName -Markers $BadStrings
-            if ($hit) {
-                Add-Finding SUSPICIOUS "Map file contains a known malware marker (`"$hit`")" $pak.FullName
+    # The game's install folder name comes from Steam's own manifest rather
+    # than being guessed, so a rename by the developer does not break this.
+    $manifest = Join-Path $root "steamapps\appmanifest_$AppId.acf"
+    if (-not (Test-Path -LiteralPath $manifest)) { continue }
+    $installDir = $null
+    foreach ($line in (Get-Content -LiteralPath $manifest -ErrorAction SilentlyContinue)) {
+        if ($line -match '"installdir"\s+"([^"]+)"') { $installDir = $Matches[1]; break }
+    }
+    if (-not $installDir) { continue }
+    $game = Join-Path $root "steamapps\common\$installDir"
+    if (-not (Test-Path -LiteralPath $game)) { continue }
+    # Unreal loads mod paks from Content\Paks\~mods, and UE4SS-style loaders
+    # from Content\Paks\LogicMods. Depth 4 covers <Project>\Content\Paks\<dir>.
+    Get-ChildItem -LiteralPath $game -Directory -Recurse -Depth 4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -in @('~mods', 'LogicMods') } |
+        ForEach-Object { $ModDirs.Add($_.FullName) }
+}
+
+function Get-MapFiles {
+    param([string]$Dir)
+    Get-ChildItem -LiteralPath $Dir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -match '^\.(pak|utoc|ucas)$' }
+}
+
+Say '  Checking your Workshop maps...' 'White'
+
+# Map files whose contents a byte search cannot see, and why. Reported, so a
+# "nothing found" never silently includes files that were not really examined.
+$BlindFiles = New-Object System.Collections.Generic.List[object]
+
+foreach ($dir in @($ItemDirs) + @($ModDirs)) {
+    # Check 2: known-bad Workshop ID. Loose mod folders have no ID to check.
+    $name = Split-Path -Leaf $dir
+    if ($ItemDirs -contains $dir -and $BadIds -contains $name) {
+        Add-Finding FOUND "Known malicious Workshop map is installed (ID $name)" $dir
+    }
+
+    # Checks 3 and 4: hash and scan the Unreal asset containers
+    foreach ($pak in (Get-MapFiles -Dir $dir)) {
+        try {
+            $h = (Get-FileHash -LiteralPath $pak.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+            if ($BadHashes -contains $h) {
+                Add-Finding FOUND 'Map file matches a known malicious file exactly' $pak.FullName
             }
+        } catch { }
+        $hit = Test-ContainsMarker -Path $pak.FullName -Markers $BadStrings
+        if ($hit) {
+            Add-Finding SUSPICIOUS "Map file contains a known malware marker (`"$hit`")" $pak.FullName
+        } else {
+            $reason = Get-ContainerBlindReason -Path $pak.FullName
+            if ($reason) { $BlindFiles.Add([pscustomobject]@{ Path = $pak.FullName; Reason = $reason }) }
         }
     }
 }
 
-if ($mapsSeen -eq 0) { Say '  No Meccha Chameleon Workshop maps are installed.' 'Green' }
-else                 { Say "  Examined $mapsSeen installed map(s)." 'DarkGray' }
+if ($ItemDirs.Count -eq 0 -and $ModDirs.Count -eq 0) {
+    Say '  No Meccha Chameleon Workshop maps are installed.' 'Green'
+} else {
+    Say "  Examined $($ItemDirs.Count) Workshop map(s) and $($ModDirs.Count) mod folder(s)." 'DarkGray'
+}
+if ($BlindFiles.Count -gt 0) {
+    # Deliberately quiet: this is normal for most Unreal maps, not a warning
+    # sign. It is here so the result is honest about what was examined.
+    Say "  Could not look inside $($BlindFiles.Count) map file(s) because they are compressed or" 'DarkGray'
+    Say '  encrypted -- normal for Unreal maps, but a malware marker inside them' 'DarkGray'
+    Say '  would not be seen. The map ID and file fingerprint checks still apply.' 'DarkGray'
+    $i = 0
+    foreach ($b in $BlindFiles) {
+        if ($i -ge 5) { Say "      ...and $($BlindFiles.Count - 5) more" 'DarkGray'; break }
+        Say "      $($b.Path) ($($b.Reason))" 'DarkGray'
+        $i++
+    }
+}
 Say ''
 
 # ------------------------------------------------------ check 5: dropped s.bat
@@ -436,8 +635,8 @@ if ($Deep) {
         }
     }
     if ($BehavRules.Count -lt 5) {
-        Write-JsonError "-Deep needs behaviour-rules.tsv, which is missing or unreadable: $rulesFile"
-        exit 2
+        Stop-Scan @("-Deep needs behaviour-rules.tsv, which is missing or unreadable: $rulesFile",
+                    "Refusing to report 'nothing suspicious' from a scan that could not run.")
     }
 
     $execExt = '^\.(bat|cmd|ps1|psm1|vbs|vbe|js|jse|wsf|hta)$'
@@ -558,12 +757,8 @@ if ($Deep) {
     $capMarkers = @('GetPlatformUserDir','SaveStringToFile','SaveStringArrayToFile',
                     'ExecuteConsoleCommand','LaunchURL','CreateProc','BP_RCE',
                     'WriteStringToFile','FileSaveDialog')
-    foreach ($root in $SteamRoots) {
-        $content = Join-Path $root "steamapps\workshop\content\$AppId"
-        if (-not (Test-Path -LiteralPath $content)) { continue }
-        $paks = Get-ChildItem -LiteralPath $content -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '^\.(pak|utoc|ucas)$' }
-        foreach ($pak in $paks) {
+    foreach ($dir in @($ItemDirs) + @($ModDirs)) {
+        foreach ($pak in (Get-MapFiles -Dir $dir)) {
             $found = @()
             foreach ($m in $capMarkers) {
                 if (Test-ContainsMarker -Path $pak.FullName -Markers @($m)) { $found += $m }
@@ -656,8 +851,15 @@ if ($Deep) {
 Say '  --------------------------------------------------------------' 'DarkGray'
 Say ''
 
-$exitCode = 0
+$exitCode   = 0
+$verdict    = 'no_known_indicators'
+$resultText = 'no known indicators found'
+# Carried in -Json output on every verdict, so a fleet dashboard that shows
+# only the verdict still cannot present "no findings" as "clean".
+$caveat = 'No known indicators is not proof a system is clean. The second stage of this attack was never captured, so what it leaves behind is unknown.'
 if ($script:FoundCount -gt 0 -or $script:SuspectCount -gt 0) {
+    $verdict    = 'indicators_found'
+    $resultText = 'INDICATORS FOUND'
     $exitCode = 1
     Say '  Something was found. Please read this carefully.' 'Red'
     Say ''
@@ -680,7 +882,9 @@ if ($script:FoundCount -gt 0 -or $script:SuspectCount -gt 0) {
     Say '      Meccha Chameleon is updated to version 3.2.0 or later.'
     Say ''
 } elseif ($script:NoteCount -gt 0) {
-    $exitCode = 3
+    $exitCode   = 3
+    $verdict    = 'worth_a_look'
+    $resultText = 'no known indicators found; behaviour worth a look'
     Say "  No known malware was found, but $($script:NoteCount) thing(s) are worth a look." 'Cyan'
     Say ''
     Say '  Do not panic. Nothing above matches this malware. The deep scan'
@@ -730,14 +934,53 @@ $header = @(
     'Meccha Chameleon Workshop malware checker',
     "Scan date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
     "Host: $env:COMPUTERNAME",
-    "Result: $(if ($exitCode -eq 0) { 'no known indicators found' } else { 'INDICATORS FOUND' })",
+    "Result: $resultText",
     ''
 )
 try {
-    Set-Content -LiteralPath $reportFile -Value ($header + $script:ReportLines) -Encoding UTF8
-    Say '  A copy of this report was saved to:' 'DarkGray'
-    Say "  $reportFile`n" 'DarkGray'
-} catch { }
+    Set-Content -LiteralPath $reportFile -Value ($header + $script:ReportLines) -Encoding UTF8 -ErrorAction Stop
+    Show '  A copy of this report was saved to:' 'DarkGray'
+    Show "  $reportFile`n" 'DarkGray'
+} catch { $reportFile = $null }
+
+# ------------------------------------------------------------- -Json result
+#
+# The schema is documented in docs/HOW-IT-WORKS.md and is a promise: fleet
+# scripts parse it. Add fields freely; renaming or removing one means bumping
+# "schema".
+if ($Json) {
+    try {
+        $findingsJson = @($script:Findings | ForEach-Object {
+            '{"severity":' + (ConvertTo-JsonText $_.severity) +
+            ',"what":'     + (ConvertTo-JsonText $_.what) +
+            ',"where":'    + (ConvertTo-JsonText $_.location) + '}'
+        }) -join ','
+        $j = New-Object System.Text.StringBuilder
+        [void]$j.Append('{"schema":1,"tool":"meccha-chameleon-checker","platform":"windows"')
+        [void]$j.Append(',"host":'               + (ConvertTo-JsonText ([string]$env:COMPUTERNAME)))
+        [void]$j.Append(',"scan_date":'          + (ConvertTo-JsonText ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))))
+        [void]$j.Append(',"indicators_updated":' + (ConvertTo-JsonText ([string]$ioc.updated)))
+        [void]$j.Append(',"deep":'               + (ConvertTo-JsonText ([bool]$Deep)))
+        [void]$j.Append(',"exit_code":'          + (ConvertTo-JsonText ([int]$exitCode)))
+        [void]$j.Append(',"verdict":'            + (ConvertTo-JsonText $verdict))
+        [void]$j.Append(',"counts":{"found":' + [int]$script:FoundCount +
+                        ',"suspicious":' + [int]$script:SuspectCount +
+                        ',"worth_a_look":' + [int]$script:NoteCount + '}')
+        [void]$j.Append(',"findings":['         + $findingsJson + ']')
+        [void]$j.Append(',"context_files":'     + (ConvertTo-JsonArray $script:InfoLines))
+        [void]$j.Append(',"uninspected_files":[' + (@($BlindFiles | ForEach-Object {
+            '{"path":' + (ConvertTo-JsonText $_.Path) + ',"reason":' + (ConvertTo-JsonText $_.Reason) + '}'
+        }) -join ',') + ']')
+        [void]$j.Append(',"steam_libraries":'   + (ConvertTo-JsonArray $SteamRoots))
+        [void]$j.Append(',"report_file":'       + (ConvertTo-JsonText $reportFile))
+        [void]$j.Append(',"caveat":'            + (ConvertTo-JsonText $caveat) + '}')
+        [Console]::Out.WriteLine($j.ToString())
+    } catch {
+        # Never leave stdout empty: a sweep must be able to tell "this machine's
+        # result could not be produced" from "this machine was never scanned".
+        Stop-Scan "could not build the JSON result: $($_.Exception.Message)"
+    }
+}
 
 if ($JsonOutput) {
     $result = if ($exitCode -eq 1) { 'indicators_found' } elseif ($exitCode -eq 3) { 'behaviour_only' } else { 'clean' }

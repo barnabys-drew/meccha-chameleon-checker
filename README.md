@@ -201,8 +201,9 @@ there.
 - It detects the **dropper**, not the second stage. The second stage was never publicly analysed.
 - The library search is depth-limited and skips system folders, so a library buried somewhere very
   unusual could be missed. Every library it *did* find is listed in the output.
-- Scanning inside map files can miss a marker if the map data is compressed. Checks 2 and 3 are the
-  reliable ones; check 4 is a bonus.
+- Scanning inside map files can't see through compression or encryption, which Unreal maps often
+  use. When that happens the result **says so and names the files** instead of quietly counting them
+  as checked. Checks 2 and 3 are the reliable ones; check 4 is a bonus.
 - **It is not an antivirus** and is no substitute for one.
 
 All indicators live in [`indicators.json`](indicators.json), so they can be audited and updated
@@ -226,7 +227,7 @@ bash tests/make-fixtures.sh                                                   # 
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\make-fixtures.ps1    # Windows
 ```
 
-Both report **13 passed, 0 failed**.
+Both must finish with **0 failed**; CI runs them on real Ubuntu and Windows runners.
 
 Fixtures are generated at runtime and never committed: a repo containing a `.bat` with the real
 payload string would be flagged by antivirus and by GitHub. Generated fixtures are inert — `echo`
@@ -239,14 +240,10 @@ statements only — and marker strings are assembled from fragments at runtime.
 | `2` | The scan could not run |
 | `3` | Deep scan only — behaviour worth a look, no known indicators |
 
-For fleet or lab automation, add `--json` on Linux or `-Json` on Windows. The
-scanner writes one stable JSON object to stdout while keeping the normal human
-report on stderr:
-
-```bash
-./scan-linux.sh --json > result.json
-powershell -File .\scan-windows.ps1 -Json > result.json
-```
+**Checking a room full of PCs** — a school lab, internet café or LAN party? Add `--json` (Linux) or
+`-Json` (Windows) and each scan prints a single JSON result on stdout, with the normal report moved
+to stderr, ready to collect into one place. The schema is in
+[HOW-IT-WORKS](docs/HOW-IT-WORKS.md#machine-readable-output).
 
 ### Detection coverage, honestly
 

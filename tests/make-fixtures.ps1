@@ -61,6 +61,30 @@ $KnownHash = (Get-FileHash -LiteralPath "$Ws\7777777777\known.pak" -Algorithm SH
 # A perfectly ordinary map, to prove we do not flag everything.
 Set-Content -LiteralPath "$Ws\1111111111\clean.pak" -Value 'a completely normal community map'
 
+# A partial download Steam has staged but not finished installing. The files
+# are on disk all the same, so they must be checked like an installed map.
+$Dl = Join-Path $Dirty "steamroot\steamapps\workshop\downloads\$AppId\5555555555"
+New-Item -ItemType Directory -Path $Dl -Force | Out-Null
+[System.IO.File]::WriteAllBytes("$Dl\partial.pak",
+    [System.Text.Encoding]::ASCII.GetBytes("PARTIAL$MarkIp"))
+
+# A map copied by hand into the game's own mod folder, outside Steam. There is
+# no Workshop ID; the install folder is resolved from Steam's app manifest.
+Set-Content -LiteralPath "$Dirty\steamroot\steamapps\appmanifest_$AppId.acf" -Value @(
+    '"AppState"', '{', "`t`"appid`"`t`t`"$AppId`"", "`t`"installdir`"`t`t`"Test Game`"", '}'
+)
+$Mods = Join-Path $Dirty 'steamroot\steamapps\common\Test Game\TestProject\Content\Paks\~mods'
+New-Item -ItemType Directory -Path $Mods -Force | Out-Null
+[System.IO.File]::WriteAllBytes("$Mods\loose.pak", ([byte[]]@() `
+    + [System.Text.Encoding]::ASCII.GetBytes('LOOSE') `
+    + [System.Text.Encoding]::Unicode.GetBytes($MarkIp)))
+
+# A filename carrying characters JSON must escape (Windows forbids " in names,
+# so an apostrophe, a backslash-bearing path and non-ASCII stand in). It
+# appears in -Json output, so a missed escape makes the result unparseable.
+[System.IO.File]::WriteAllBytes("$Mods\odd 'name' $([char]0x00E9).pak",
+    [System.Text.Encoding]::ASCII.GetBytes("ODD$MarkIp"))
+
 # The dropped file, in Documents where the malware writes it (check 5).
 Set-Content -LiteralPath "$Dirty\home\Documents\s.bat" -Value @(
     '@echo off',
@@ -95,6 +119,37 @@ New-Item -ItemType Directory -Path "$Clean\home\Documents" -Force | Out-Null
 New-Item -ItemType Directory -Path "$Clean\home\Startup"   -Force | Out-Null
 Set-Content -LiteralPath "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222\nice.pak" `
             -Value 'a completely normal community map'
+
+# Unreal containers whose contents a byte search cannot see. Headers follow the
+# real UE5 layouts (checked against shipping games): the scan must SAY it could
+# not look inside these, rather than count them as examined and clean.
+$Cw = "$Clean\steamroot\steamapps\workshop\content\$AppId\2222222222"
+function New-Name32 { param([string]$N) $b = New-Object byte[] 32; [System.Text.Encoding]::ASCII.GetBytes($N).CopyTo($b, 0); ,$b }  # comma: return byte[], not unrolled
+function New-Utoc {
+    param([string]$Path, [byte]$Flags, [string]$Method)
+    $ms = New-Object System.IO.MemoryStream
+    $w  = New-Object System.IO.BinaryWriter $ms
+    $w.Write([System.Text.Encoding]::ASCII.GetBytes('-==--==--==--==-'))
+    $w.Write([byte]8); $w.Write((New-Object byte[] 3))                     # version 8
+    $nmeth = if ($Method) { 1 } else { 0 }
+    foreach ($v in 144, 1, 1, 12, $nmeth, 32, 65536, 0, 1) { $w.Write([uint32]$v) }
+    $w.Write((New-Object byte[] 24))                                       # container ID, key GUID
+    $w.Write($Flags); $w.Write((New-Object byte[] 3)); $w.Write([uint32]0) # flags, hash seeds
+    $w.Write((New-Object byte[] 8)); $w.Write([uint32]0)                   # partition size, no-hash count
+    $w.Write((New-Object byte[] 44))                                       # to 144 bytes
+    $w.Write((New-Object byte[] 34))                                       # one chunk ID + offset, one block
+    if ($Method) { $w.Write((New-Name32 $Method)) }
+    $w.Flush(); [System.IO.File]::WriteAllBytes($Path, $ms.ToArray())
+}
+New-Utoc "$Cw\oodle.utoc"  9  'Oodle'
+New-Utoc "$Cw\locked.utoc" 10 ''
+New-Utoc "$Cw\plain.utoc"  8  ''
+[System.IO.File]::WriteAllBytes("$Cw\oodle.ucas", [System.Text.Encoding]::ASCII.GetBytes('opaque compressed bytes'))
+$ms = New-Object System.IO.MemoryStream; $w = New-Object System.IO.BinaryWriter $ms
+$w.Write([System.Text.Encoding]::ASCII.GetBytes('opaque compressed bytes'))
+$w.Write((New-Object byte[] 17)); $w.Write([uint32]0x5A6F12E1); $w.Write([uint32]11)   # v11 footer
+$w.Write((New-Object byte[] 36)); $w.Write((New-Name32 'Zlib')); $w.Write((New-Object byte[] 128))
+$w.Flush(); [System.IO.File]::WriteAllBytes("$Cw\zlib.pak", $ms.ToArray())
 
 # -------------------------------------------------------------- variant tree
 #
@@ -138,7 +193,9 @@ Write-Host ''
 Check ($OutDirty -match 'Known malicious Workshop map is installed \(ID 3765145606\)') 'check 2  known-bad Workshop ID'
 Check ($OutDirty -match 'matches a known malicious file exactly')                      'check 3  file hash match'
 Check ($OutDirty -match 'Map file contains a known malware marker')                    'check 4  UTF-16 marker inside .pak'
-Check ($OutDirty -match 'where the malware drops its file')                            'check 5  s.bat in Documents'
+Check ($OutDirty -match "workshop\\downloads\\$AppId\\5555555555\\partial\.pak")    'check 4  partial download in workshop\downloads'
+Check ($OutDirty -match 'Content\\Paks\\~mods\\loose\.pak')                          "check 4  hand-installed map in the game's ~mods folder"
+Check ($OutDirty -match 'where the malware drops its file')                          'check 5  s.bat in Documents'
 Check ($OutDirty -match 'A script here contains a known malware marker')               'check 5b renamed .cmd variant'
 Check ($OutDirty -match 'A startup file refers to the malware')                        'check 6  Startup folder persistence'
 Check ($OutDirty -match 'This tool has changed nothing')                               'states that nothing was modified'
@@ -158,11 +215,66 @@ Check ($OutClean -match 'No known indicators of this malware were found') 'repor
 Check ($OutClean -match 'not proof that you are clean')                   "keeps the 'not proof you are clean' caveat"
 Check ($RcClean -eq 0)                                                    "exit code 0 when nothing found (got $RcClean)"
 
-$JsonClean = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Scanner `
-                 -ScanRoot $Clean -Indicators (Join-Path $Repo 'indicators.json') -NoColor -Json 2>$null | Out-String
-try { $JsonCleanResult = $JsonClean | ConvertFrom-Json } catch { $JsonCleanResult = $null }
-Check ($null -ne $JsonCleanResult -and $JsonCleanResult.result -eq 'clean' -and $JsonCleanResult.exit_code -eq 0) `
-      '-Json emits a parseable clean result'
+# Containers the byte search cannot see into are named, with the reason, and
+# do not change the verdict -- compression is normal, not a warning sign.
+Check ($OutClean -match 'Could not look inside 4 map file\(s\)')          'reports how many map files could not be looked inside'
+Check ($OutClean -match 'oodle\.ucas \(compressed with Oodle\)')          'reads the compression method from a .utoc, for its .ucas'
+Check ($OutClean -match 'locked\.utoc \(encrypted\)')                     'recognises an encrypted IoStore container'
+Check ($OutClean -match 'zlib\.pak \(compressed with Zlib\)')             'reads the compression method from a legacy .pak footer'
+Check (-not ($OutClean -match 'plain\.utoc|nice\.pak'))                   'does not list containers whose bytes are searchable'
+
+# ------------------------------------------------------------- -Json output
+#
+# Fleet scripts parse this, so the contract is: stdout is exactly one valid
+# JSON document, human text never leaks into it, and a scan that could not
+# run still says so in JSON rather than printing nothing.
+
+Write-Host ''
+Write-Host '  Machine-readable output (-Json)'
+Write-Host '  -------------------------------'
+
+function Invoke-JsonScan {
+    param([string[]]$ScanArgs)
+    $errFile = Join-Path $Fix 'json.err'
+    $p = Start-Process -FilePath 'powershell.exe' -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput (Join-Path $Fix 'json.out') -RedirectStandardError $errFile `
+            -ArgumentList (@('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$Scanner`"",'-Json') + $ScanArgs)
+    $out = Get-Content -LiteralPath (Join-Path $Fix 'json.out') -Raw -Encoding UTF8
+    $obj = $null
+    $err = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
+    $why = $null
+    if ([string]::IsNullOrWhiteSpace($out)) { $why = 'stdout was empty' }
+    else { try { $obj = $out | ConvertFrom-Json -ErrorAction Stop } catch { $why = $_.Exception.Message } }
+    if ($why) {
+        # Otherwise this is just "FAIL" with no clue why. Show what the scanner
+        # actually produced.
+        Write-Host "  (-Json output did not parse: $why)" -ForegroundColor Yellow
+        Write-Host "  rc=$($p.ExitCode) stdout: $("$out".Substring(0, [Math]::Min(600, "$out".Length)))"
+        $errTail = "$err"; if ($errTail.Length -gt 1500) { $errTail = $errTail.Substring($errTail.Length - 1500) }
+        Write-Host "  stderr tail: $errTail"
+    }
+    [pscustomobject]@{ Rc = $p.ExitCode; Out = $out; Obj = $obj; Err = $err }
+}
+
+$J = Invoke-JsonScan @('-ScanRoot', "`"$Dirty`"", '-Indicators', "`"$TestIoc`"")
+Check ($J.Obj -and $J.Obj.verdict -eq 'indicators_found')  "-Json stdout parses, verdict indicators_found (got $($J.Obj.verdict) $($J.Obj.error))"
+Check ($J.Obj -and ($J.Obj.counts.found + $J.Obj.counts.suspicious) -eq @($J.Obj.findings).Count) `
+      '-Json lists one finding per counted indicator'
+Check ($J.Obj -and [bool](@($J.Obj.findings) | Where-Object { $_.where -like "*odd 'name' $([char]0x00E9).pak" })) `
+      '-Json keeps unusual characters in paths intact'
+Check ($J.Rc -eq 1 -and $J.Obj -and $J.Obj.exit_code -eq 1) "-Json exit_code field matches the real exit code (rc $($J.Rc))"
+Check (-not ($J.Out -match 'Please read this carefully'))   '-Json keeps human text off stdout'
+Check ($J.Err -match 'Please read this carefully')          '-Json still shows the human report on stderr'
+
+$J = Invoke-JsonScan @('-ScanRoot', "`"$Clean`"", '-Indicators', "`"$(Join-Path $Repo 'indicators.json')`"")
+Check ($J.Obj -and $J.Obj.verdict -eq 'no_known_indicators') "-Json clean verdict is no_known_indicators, never 'clean'"
+Check ($J.Obj -and @($J.Obj.uninspected_files).Count -eq 4)   '-Json lists files that could not be looked inside'
+Check ($J.Obj -and $J.Obj.caveat -match 'not proof')          "-Json carries the 'not proof' caveat"
+
+Set-Content -LiteralPath "$Fix\bad.json" -Value '{ "broken": true }'
+$J = Invoke-JsonScan @('-ScanRoot', "`"$Clean`"", '-Indicators', "`"$Fix\bad.json`"")
+Check ($J.Rc -eq 2 -and $J.Obj -and $J.Obj.verdict -eq 'scan_failed') `
+      "-Json reports scan_failed with exit 2 when it cannot run (rc $($J.Rc))"
 
 # --------------------------------------- repackaged variant, -Deep vs not
 

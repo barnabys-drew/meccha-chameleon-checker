@@ -33,6 +33,9 @@ Usage: ./scan-linux.sh [options]
   --scan-root DIR    Scan DIR as a synthetic root instead of the real system
                      (used by the test fixtures)
   --indicators FILE  Use an alternative indicators file
+  --json             Print one machine-readable JSON result on stdout, for
+                     checking many computers at once. The normal report
+                     still appears, on stderr.
   --no-color         Disable coloured output
   --json             Emit one machine-readable result on stdout
   -h, --help         Show this help
@@ -46,6 +49,7 @@ while [ $# -gt 0 ]; do
         --deep)        DEEP=1; shift ;;
         --scan-root)   SCAN_ROOT="${2:-}"; shift 2 ;;
         --indicators)  INDICATORS="${2:-}"; shift 2 ;;
+        --json)        JSON=1; shift ;;
         --no-color)    USE_COLOR=0; shift ;;
         --json)        JSON=1; USE_COLOR=0; shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -53,7 +57,33 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ]; then USE_COLOR=0; fi
+# Everything a person reads goes to fd 3. Normally that is stdout; with --json
+# it is stderr, so stdout carries exactly one JSON document and nothing else --
+# a stray progress line would make every result unparseable.
+if [ "$JSON" = 1 ]; then exec 3>&2; else exec 3>&1; fi
+
+# A JSON string literal. Paths are the only untrusted text here, and a
+# filename can legally contain quotes, backslashes and control characters.
+json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')"
+}
+
+# Exit 2 -- the scan could not run. Under --json this still prints a result, so
+# a sweep of many machines records "failed" rather than silently skipping one.
+abort() {  # abort <line>...
+    local l
+    for l in "$@"; do printf '%s\n' "$l" >&2; done
+    if [ "$JSON" = 1 ]; then
+        printf '{"schema":1,"tool":"meccha-chameleon-checker","platform":"linux","host":%s,"exit_code":2,"verdict":"scan_failed","error":%s}\n' \
+            "$(json_str "$(uname -n 2>/dev/null)")" "$(json_str "$1")"
+    fi
+    exit 2
+}
+
+if [ ! -t 3 ] || [ -n "${NO_COLOR:-}" ]; then USE_COLOR=0; fi
 if [ "$USE_COLOR" = 1 ]; then
     C_RED=$'\033[1;31m'; C_YEL=$'\033[1;33m'; C_GRN=$'\033[1;32m'
     C_CYA=$'\033[1;36m'
@@ -63,30 +93,7 @@ else
 fi
 
 # Print to the screen and capture for the report file.
-say() {
-    if [ "$JSON" = 1 ]; then printf '%s\n' "$1" >&2; else printf '%s\n' "$1"; fi
-    REPORT_LINES+=("$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')")
-}
-
-json_escape() {
-    local s="$1"
-    s=${s//\\/\\\\}; s=${s//\"/\\\"}
-    s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
-    printf '%s' "$s"
-}
-
-emit_json_error() {
-    local message="$1"
-    printf '{"tool_version":"1.0.0","indicators_updated":null,"scanned_at":"%s","host":"%s","platform":"linux","deep":%s,"result":"error","exit_code":2,"steam_libraries":[],"maps_examined":0,"findings":[{"severity":"note","check":"error","message":"%s","path":null}]}\n' \
-        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(json_escape "$(hostname 2>/dev/null)")" \
-        "$([ "$DEEP" = 1 ] && echo true || echo false)" "$(json_escape "$message")"
-}
-
-fatal() {
-    local message="$1"
-    if [ "$JSON" = 1 ]; then emit_json_error "$message"; else printf 'ERROR: %s\n' "$message" >&2; fi
-    exit 2
-}
+say() { printf '%s\n' "$1" >&3; REPORT_LINES+=("$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"); }
 
 # ------------------------------------------------------------- indicator load
 #
@@ -97,7 +104,7 @@ fatal() {
 # worst thing this tool could do.
 
 if [ ! -r "$INDICATORS" ]; then
-    fatal "cannot read indicators file: $INDICATORS"
+    abort "ERROR: cannot read indicators file: $INDICATORS"
 fi
 
 APPID=$(grep -oE '"steam_appid"[[:space:]]*:[[:space:]]*"[0-9]+"' "$INDICATORS" \
@@ -131,7 +138,8 @@ mapfile -t BAD_STRINGS < <(extract_array content_strings)
 mapfile -t DROP_NAMES  < <(extract_array dropped_filenames)
 
 if [ -z "$APPID" ] || [ "${#BAD_HASHES[@]}" -eq 0 ] || [ "${#BAD_STRINGS[@]}" -eq 0 ]; then
-    fatal "could not parse indicators from $INDICATORS -- refusing to report a misleading 'clean' result"
+    abort "ERROR: could not parse indicators from $INDICATORS -- refusing to report a" \
+          "       misleading 'clean' result. The file may be corrupt."
 fi
 
 # Undocumented, for the test suite: prove exactly what was parsed. Indicator
@@ -151,10 +159,11 @@ fi
 FOUND_COUNT=0
 SUSPECT_COUNT=0
 NOTE_COUNT=0
-JSON_SEVERITIES=()
-JSON_CHECKS=()
-JSON_MESSAGES=()
-JSON_PATHS=()
+FINDINGS_JSON=()   # one JSON object per finding, in report order, for --json
+
+record() {  # record <severity> <what> <where>
+    FINDINGS_JSON+=("{\"severity\":\"$1\",\"what\":$(json_str "$2"),\"where\":$(json_str "$3")}")
+}
 
 # A third tier, used only by --deep. These are behaviour patterns, not known
 # indicators: they describe something that LOOKS like how this malware works,
@@ -162,8 +171,7 @@ JSON_PATHS=()
 # counts so behaviour alone never reads as "you are infected".
 note() {  # note <what> <where>
     NOTE_COUNT=$((NOTE_COUNT + 1))
-    JSON_SEVERITIES+=("note"); JSON_CHECKS+=("${3:-behaviour}")
-    JSON_MESSAGES+=("$1"); JSON_PATHS+=("$2")
+    record WORTH_A_LOOK "$1" "$2"
     say "  ${C_CYA}[WORTH A LOOK]${C_OFF} $1"
     say "                 ${C_DIM}$2${C_OFF}"
 }
@@ -176,9 +184,8 @@ INFO_LINES=()
 info() { INFO_LINES+=("$1"); }
 
 finding() {  # finding <FOUND|SUSPICIOUS> <what> <where>
-    local sev="$1" what="$2" where="$3" check="${4:-indicator}"
-    JSON_SEVERITIES+=("$(printf '%s' "$sev" | tr 'A-Z' 'a-z')")
-    JSON_CHECKS+=("$check"); JSON_MESSAGES+=("$what"); JSON_PATHS+=("$where")
+    local sev="$1" what="$2" where="$3"
+    record "$sev" "$what" "$where"
     if [ "$sev" = "FOUND" ]; then
         FOUND_COUNT=$((FOUND_COUNT + 1))
         say "  ${C_RED}[FOUND]${C_OFF}      $what"
@@ -194,6 +201,82 @@ finding() {  # finding <FOUND|SUSPICIOUS> <what> <where>
 contains_string() {
     local file="$1" needle="$2"
     LC_ALL=C tr -d '\000' < "$file" 2>/dev/null | LC_ALL=C grep -qaF -- "$needle"
+}
+
+# ------------------------------------------------ what a byte search can't see
+#
+# Checks 4 and B3 search a map file's raw bytes. That only works when the data
+# is stored as-is. Unreal usually compresses it -- UE5 defaults to Oodle, which
+# is proprietary and compiled into each game, so no zero-dependency tool can
+# undo it -- and can encrypt it with a key only the game has. In either case a
+# marker inside is invisible, and the search would quietly say "not found".
+#
+# This reads only the container's header or footer and never decompresses
+# anything. It prints why the raw bytes cannot be searched, or nothing if they
+# can. The layouts below were checked against shipping UE5 games.
+
+u8_at()  { od -An -t u1 -j "$2" -N 1 "$1" 2>/dev/null | tr -d ' \n'; }
+u32_at() { od -An -t u4 --endian=little -j "$2" -N 4 "$1" 2>/dev/null | tr -d ' \n'; }
+
+# A run of fixed-width, NUL-padded compression method names, joined by ", ".
+method_names() {  # method_names <file> <offset> <count> <width>
+    local i n out=""
+    for (( i = 0; i < $3 && i < 8; i++ )); do
+        n="$(LC_ALL=C tail -c +$(( $2 + i * $4 + 1 )) "$1" 2>/dev/null | head -c "$4" \
+             | LC_ALL=C tr -d '\000' | LC_ALL=C tr -cd 'A-Za-z0-9_')"
+        [ -n "$n" ] && out="${out:+$out, }$n"
+    done
+    printf '%s' "$out"
+}
+
+container_blind_reason() {  # container_blind_reason <.pak|.utoc|.ucas>
+    local f="$1" size ver flags hdr entries blocks bsize nmeth nlen seeds nophash off names pos
+    case "${f,,}" in
+        # A .ucas holds the data; its .utoc next to it says how it is stored.
+        *.ucas) f="${f%.*}.utoc"; [ -r "$f" ] || return 0 ;;
+    esac
+    size="$(stat -c %s "$f" 2>/dev/null)" || return 0
+
+    case "${f,,}" in
+    *.utoc)
+        # FIoStoreTocHeader, 144 bytes, starting with a 16-byte magic.
+        [ "$size" -ge 144 ] || return 0
+        [ "$(LC_ALL=C head -c 16 "$f")" = "-==--==--==--==-" ] || return 0
+        flags="$(u8_at "$f" 80)"
+        if (( flags & 2 )); then echo "encrypted"; return 0; fi
+        nmeth="$(u32_at "$f" 36)"
+        [ "${nmeth:-0}" -gt 0 ] || return 0
+        # Method names follow the header, the chunk ID (12 bytes) and offset
+        # (10 bytes) tables, the perfect-hash tables and the block table.
+        hdr="$(u32_at "$f" 20)";    entries="$(u32_at "$f" 24)"
+        blocks="$(u32_at "$f" 28)"; bsize="$(u32_at "$f" 32)"; nlen="$(u32_at "$f" 40)"
+        seeds="$(u32_at "$f" 84)";  nophash="$(u32_at "$f" 96)"
+        off=$(( hdr + entries * 22 + seeds * 4 + nophash * 4 + blocks * bsize ))
+        names=""
+        [ "$nlen" = 32 ] && [ $(( off + nmeth * nlen )) -le "$size" ] \
+            && names="$(method_names "$f" "$off" "$nmeth" 32)"
+        echo "compressed${names:+ with $names}"
+        ;;
+    *.pak)
+        # FPakInfo footer: magic E1 12 6F 5A, a fixed distance from the end
+        # that depends on the pak version, then compression method names
+        # running to end of file. The byte before the magic flags an
+        # encrypted index.
+        for pos in 204 205 172 44; do
+            [ "$size" -ge "$pos" ] || continue
+            [ "$(od -An -t x1 -j $(( size - pos )) -N 4 "$f" 2>/dev/null | tr -d ' \n')" = "e1126f5a" ] || continue
+            ver="$(u32_at "$f" $(( size - pos + 4 )))"
+            if [ "$pos" != 44 ] && [ "$(u8_at "$f" $(( size - pos - 1 )))" = 1 ]; then
+                echo "encrypted"; return 0
+            fi
+            off=$(( size - pos + 44 )); [ "$ver" = 9 ] && off=$(( off + 1 ))
+            names="$(method_names "$f" "$off" $(( (size - off) / 32 )) 32)"
+            [ -n "$names" ] && echo "compressed with $names"
+            return 0
+        done
+        ;;
+    esac
+    return 0
 }
 
 # --------------------------------------------------------------------- banner
@@ -216,12 +299,14 @@ if [ -n "$SCAN_ROOT" ]; then
     HOME_DIR="$SCAN_ROOT/home"
     [ -d "$SCAN_ROOT/steamroot" ] && STEAM_ROOTS+=("$SCAN_ROOT/steamroot")
 else
-    # (a) The standard per-user install locations, including Flatpak.
+    # (a) The standard per-user install locations, including Flatpak, and
+    #     ~/Steam, where steamcmd installs by default.
     for cand in \
         "$HOME/.steam/steam" \
         "$HOME/.steam/root" \
         "$HOME/.local/share/Steam" \
-        "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+        "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam" \
+        "$HOME/Steam"
     do
         [ -d "$cand/steamapps" ] && STEAM_ROOTS+=("$cand")
     done
@@ -253,7 +338,7 @@ else
     done
     mapfile -t MOUNTS < <(printf '%s\n' "${MOUNTS[@]}" | awk 'NF && !seen[$0]++')
 
-    say '  Searching all drives for Steam libraries...'
+    printf '  Searching all drives for Steam libraries...\n' >&3
     for mp in "${MOUNTS[@]}"; do
         [ -d "$mp" ] || continue
         # Common library folder names sitting directly on a drive.
@@ -297,47 +382,114 @@ fi
 
 # ----------------------------------------------- checks 2+3+4: workshop maps
 
-say "${C_BLD}  Checking your subscribed Workshop maps...${C_OFF}"
-
-WORKSHOP_DIRS_SEEN=0
+# Every place a map can sit on disk, gathered once so the IOC checks and the
+# --deep capability check always examine the same set.
+#
+#   ITEM_DIRS  one folder per Workshop item, named by its Workshop ID. Both the
+#              finished install (content/) and Steam's staging area for an
+#              interrupted or in-progress download (downloads/) -- a partial
+#              download is still a malicious file on disk.
+#   MOD_DIRS   folders of loose map files with no Workshop ID: maps a player
+#              copied into the game's own mod folders by hand, outside Steam.
+ITEM_DIRS=()
+MOD_DIRS=()
 for root in "${STEAM_ROOTS[@]:-}"; do
-    content="$root/steamapps/workshop/content/$APPID"
-    [ -d "$content" ] || continue
-
-    for item in "$content"/*/; do
-        [ -d "$item" ] || continue
-        WORKSHOP_DIRS_SEEN=$((WORKSHOP_DIRS_SEEN + 1))
-        id="$(basename "$item")"
-
-        # Check 2: known-bad Workshop ID
-        for bad in "${BAD_IDS[@]:-}"; do
-            if [ "$id" = "$bad" ]; then
-                finding FOUND "Known malicious Workshop map is installed (ID $id)" "$item"
-            fi
+    [ -n "$root" ] || continue
+    for base in "$root/steamapps/workshop/content/$APPID" \
+                "$root/steamapps/workshop/downloads/$APPID"; do
+        [ -d "$base" ] || continue
+        for item in "$base"/*/; do
+            [ -d "$item" ] && ITEM_DIRS+=("${item%/}")
         done
-
-        # Checks 3 and 4: hash and byte-scan the Unreal asset containers
-        while IFS= read -r -d '' pak; do
-            h="$(sha256sum "$pak" 2>/dev/null | cut -d' ' -f1 | tr 'A-Z' 'a-z')"
-            for bad in "${BAD_HASHES[@]}"; do
-                if [ -n "$h" ] && [ "$h" = "$bad" ]; then
-                    finding FOUND "Map file matches a known malicious file exactly" "$pak"
-                fi
-            done
-            for s in "${BAD_STRINGS[@]}"; do
-                if contains_string "$pak" "$s"; then
-                    finding SUSPICIOUS "Map file contains a known malware marker (\"$s\")" "$pak"
-                    break
-                fi
-            done
-        done < <(find "$item" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
     done
+
+    # The game's install folder name comes from Steam's own manifest rather
+    # than being guessed, so a rename by the developer does not break this.
+    game=""
+    manifest="$root/steamapps/appmanifest_$APPID.acf"
+    if [ -r "$manifest" ]; then
+        installdir="$(grep -oE '"installdir"[[:space:]]+"[^"]+"' "$manifest" \
+                      | sed 's/.*"installdir"[[:space:]]*"//; s/"$//' | head -1)"
+        [ -n "$installdir" ] && game="$root/steamapps/common/$installdir"
+    fi
+    [ -d "$game" ] || continue
+    # Unreal loads mod paks from Content/Paks/~mods, and UE4SS-style loaders
+    # from Content/Paks/LogicMods. Depth 5 covers <Project>/Content/Paks/<dir>.
+    while IFS= read -r -d '' m; do
+        MOD_DIRS+=("$m")
+    done < <(find "$game" -maxdepth 5 -type d \( -iname '~mods' -o -iname 'LogicMods' \) -print0 2>/dev/null)
 done
 
-if [ "$WORKSHOP_DIRS_SEEN" -eq 0 ]; then
+say "${C_BLD}  Checking your Workshop maps...${C_OFF}"
+
+# Map files whose contents a byte search cannot see, and why. Reported, so a
+# "nothing found" never silently includes files that were not really examined.
+BLIND_FILES=()
+BLIND_REASONS=()
+
+# Checks 3 and 4: hash and byte-scan the Unreal asset containers under a folder.
+scan_map_files() {  # scan_map_files <dir>
+    local pak h bad s hit reason
+    while IFS= read -r -d '' pak; do
+        h="$(sha256sum "$pak" 2>/dev/null | cut -d' ' -f1 | tr 'A-Z' 'a-z')"
+        for bad in "${BAD_HASHES[@]}"; do
+            if [ -n "$h" ] && [ "$h" = "$bad" ]; then
+                finding FOUND "Map file matches a known malicious file exactly" "$pak"
+            fi
+        done
+        hit=0
+        for s in "${BAD_STRINGS[@]}"; do
+            if contains_string "$pak" "$s"; then
+                finding SUSPICIOUS "Map file contains a known malware marker (\"$s\")" "$pak"
+                hit=1
+                break
+            fi
+        done
+        if [ "$hit" = 0 ]; then
+            reason="$(container_blind_reason "$pak")"
+            if [ -n "$reason" ]; then
+                BLIND_FILES+=("$pak"); BLIND_REASONS+=("$reason")
+            fi
+        fi
+    done < <(find "$1" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
+}
+
+for item in "${ITEM_DIRS[@]:-}"; do
+    [ -n "$item" ] || continue
+    id="$(basename "$item")"
+
+    # Check 2: known-bad Workshop ID
+    for bad in "${BAD_IDS[@]:-}"; do
+        if [ "$id" = "$bad" ]; then
+            finding FOUND "Known malicious Workshop map is installed (ID $id)" "$item"
+        fi
+    done
+
+    scan_map_files "$item"
+done
+
+for m in "${MOD_DIRS[@]:-}"; do
+    [ -n "$m" ] && scan_map_files "$m"
+done
+
+if [ "${#ITEM_DIRS[@]}" -eq 0 ] && [ "${#MOD_DIRS[@]}" -eq 0 ]; then
     say "  ${C_GRN}No Meccha Chameleon Workshop maps are installed.${C_OFF}"
 else
-    say "  ${C_DIM}Examined $WORKSHOP_DIRS_SEEN installed map(s).${C_OFF}"
+    say "  ${C_DIM}Examined ${#ITEM_DIRS[@]} Workshop map(s) and ${#MOD_DIRS[@]} mod folder(s).${C_OFF}"
+fi
+if [ "${#BLIND_FILES[@]}" -gt 0 ]; then
+    # Deliberately quiet: this is normal for most Unreal maps, not a warning
+    # sign. It is here so the result is honest about what was examined.
+    say "  ${C_DIM}Could not look inside ${#BLIND_FILES[@]} map file(s) because they are compressed or${C_OFF}"
+    say "  ${C_DIM}encrypted -- normal for Unreal maps, but a malware marker inside them${C_OFF}"
+    say "  ${C_DIM}would not be seen. The map ID and file fingerprint checks still apply.${C_OFF}"
+    for (( i = 0; i < ${#BLIND_FILES[@]}; i++ )); do
+        if [ "$i" -ge 5 ]; then
+            say "  ${C_DIM}    ...and $(( ${#BLIND_FILES[@]} - 5 )) more${C_OFF}"
+            break
+        fi
+        say "  ${C_DIM}    ${BLIND_FILES[$i]} (${BLIND_REASONS[$i]})${C_OFF}"
+    done
 fi
 say ""
 
@@ -451,7 +603,10 @@ if [ "$DEEP" = 1 ]; then
         BEHAV_RULE_COUNT=$(grep -cvE '^[[:space:]]*(#|$)' "$BEHAV_RULES_FILE" 2>/dev/null || echo 0)
     fi
     if [ "$BEHAV_RULE_COUNT" -lt 5 ]; then
-        fatal "--deep needs behaviour-rules.tsv, which is missing or unreadable: $BEHAV_RULES_FILE"
+        abort "ERROR: --deep needs behaviour-rules.tsv, which is missing or unreadable:" \
+              "       $BEHAV_RULES_FILE" \
+              "       Re-download the tool and keep all files together in one folder." \
+              "       Refusing to report 'nothing suspicious' from a scan that could not run."
     fi
 
     # Files worth analysing, and files merely worth noticing by location.
@@ -596,9 +751,8 @@ if [ "$DEEP" = 1 ]; then
     # match inside a large binary is not worth frightening anyone over; writing
     # a file AND launching something is a different matter.
     CAP_PAT='getplatformuserdir|savestringtofile|savestringarraytofile|executeconsolecommand|launchurl|createproc|bp_rce|filesavedialog|writestringtofile'
-    for root in "${STEAM_ROOTS[@]:-}"; do
-        content="$root/steamapps/workshop/content/$APPID"
-        [ -d "$content" ] || continue
+    for mapdir in "${ITEM_DIRS[@]:-}" "${MOD_DIRS[@]:-}"; do
+        [ -n "$mapdir" ] || continue
         while IFS= read -r -d '' pak; do
             [ -n "${BEHAV_SEEN[$pak]:-}" ] && continue
             hits="$(LC_ALL=C tr -d '\000' < "$pak" 2>/dev/null | tr 'A-Z' 'a-z' \
@@ -608,7 +762,7 @@ if [ "$DEEP" = 1 ]; then
                 BEHAV_SEEN[$pak]=1
                 note "A map can write files or launch programs, which maps do not need ($(printf '%s' "$hits" | tr '\n' ' '))" "$pak"
             fi
-        done < <(find "$content" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
+        done < <(find "$mapdir" -type f \( -iname '*.pak' -o -iname '*.utoc' -o -iname '*.ucas' \) -print0 2>/dev/null)
     done
 
     # -- B4: evidence that something already ran ----------------------------
@@ -671,8 +825,13 @@ say "  ${C_DIM}--------------------------------------------------------------${C
 say ""
 
 EXIT=0
+VERDICT="no_known_indicators"; RESULT_TEXT="no known indicators found"
+# Carried in --json output on every verdict, so a fleet dashboard that shows
+# only the verdict still cannot present "no findings" as "clean".
+CAVEAT="No known indicators is not proof a system is clean. The second stage of this attack was never captured, so what it leaves behind is unknown."
 if [ "$FOUND_COUNT" -gt 0 ] || [ "$SUSPECT_COUNT" -gt 0 ]; then
     EXIT=1
+    VERDICT="indicators_found"; RESULT_TEXT="INDICATORS FOUND"
     say "  ${C_RED}${C_BLD}Something was found. Please read this carefully.${C_OFF}"
     say ""
     say "  Confirmed indicators: $FOUND_COUNT      Suspicious: $SUSPECT_COUNT"
@@ -695,6 +854,7 @@ if [ "$FOUND_COUNT" -gt 0 ] || [ "$SUSPECT_COUNT" -gt 0 ]; then
     say ""
 elif [ "$NOTE_COUNT" -gt 0 ]; then
     EXIT=3
+    VERDICT="worth_a_look"; RESULT_TEXT="no known indicators found; behaviour worth a look"
     say "  ${C_CYA}${C_BLD}No known malware was found, but $NOTE_COUNT thing(s) are worth a look.${C_OFF}"
     say ""
     say "  ${C_BLD}Do not panic.${C_OFF} Nothing above matches this malware. The deep scan"
@@ -743,25 +903,40 @@ REPORT_FILE="$REPORT_DIR/meccha-check-report-$(date +%Y%m%d-%H%M%S).txt"
     printf 'Meccha Chameleon Workshop malware checker\n'
     printf 'Scan date: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
     printf 'Host: %s\n' "$(uname -sr 2>/dev/null)"
-    printf 'Result: %s\n\n' "$([ "$EXIT" = 0 ] && echo 'no known indicators found' || echo 'INDICATORS FOUND')"
+    printf 'Result: %s\n\n' "$RESULT_TEXT"
     printf '%s\n' "${REPORT_LINES[@]}"
 } >"$REPORT_FILE" 2>/dev/null \
-    && { say "  ${C_DIM}A copy of this report was saved to:${C_OFF}"; say "  $REPORT_FILE"; say ""; }
+    && printf '  %sA copy of this report was saved to:%s\n  %s\n\n' "$C_DIM" "$C_OFF" "$REPORT_FILE" >&3 \
+    || REPORT_FILE=""
+
+# ------------------------------------------------------------ --json result
+#
+# The schema is documented in docs/HOW-IT-WORKS.md and is a promise: fleet
+# scripts parse it. Add fields freely; renaming or removing one means bumping
+# "schema".
 
 if [ "$JSON" = 1 ]; then
-    case "$EXIT" in 1) RESULT=indicators_found;; 3) RESULT=behaviour_only;; *) RESULT=clean;; esac
-    printf '{"tool_version":"1.0.0","indicators_updated":"%s","scanned_at":"%s","host":"%s","platform":"linux","deep":%s,"result":"%s","exit_code":%s,"steam_libraries":[' \
-        "$(json_escape "$INDICATORS_UPDATED")" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-        "$(json_escape "$(hostname 2>/dev/null)")" "$([ "$DEEP" = 1 ] && echo true || echo false)" "$RESULT" "$EXIT"
-    for i in "${!STEAM_ROOTS[@]}"; do [ "$i" = 0 ] || printf ','; printf '"%s"' "$(json_escape "${STEAM_ROOTS[$i]}")"; done
-    printf '],"maps_examined":%s,"findings":[' "$WORKSHOP_DIRS_SEEN"
-    for i in "${!JSON_MESSAGES[@]}"; do
-        [ "$i" = 0 ] || printf ','
-        printf '{"severity":"%s","check":"%s","message":"%s","path":"%s"}' \
-            "$(json_escape "${JSON_SEVERITIES[$i]}")" "$(json_escape "${JSON_CHECKS[$i]}")" \
-            "$(json_escape "${JSON_MESSAGES[$i]}")" "$(json_escape "${JSON_PATHS[$i]}")"
+    join_json() { local IFS=,; printf '%s' "$*"; }
+    libs=(); for r in "${STEAM_ROOTS[@]:-}"; do [ -n "$r" ] && libs+=("$(json_str "$r")"); done
+    ctx=();  for c in "${INFO_LINES[@]:-}";  do [ -n "$c" ] && ctx+=("$(json_str "$c")"); done
+    blind=()
+    for (( i = 0; i < ${#BLIND_FILES[@]}; i++ )); do
+        blind+=("{\"path\":$(json_str "${BLIND_FILES[$i]}"),\"reason\":$(json_str "${BLIND_REASONS[$i]}")}")
     done
-    printf ']}\n'
+    printf '{"schema":1,"tool":"meccha-chameleon-checker","platform":"linux"'
+    printf ',"host":%s'               "$(json_str "$(uname -n 2>/dev/null)")"
+    printf ',"scan_date":%s'          "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    printf ',"indicators_updated":%s' "$(json_str "$(grep -oE '"updated"[^,]*' "$INDICATORS" | grep -oE '[0-9-]{10}')")"
+    printf ',"deep":%s'               "$([ "$DEEP" = 1 ] && echo true || echo false)"
+    printf ',"exit_code":%s,"verdict":"%s"' "$EXIT" "$VERDICT"
+    printf ',"counts":{"found":%s,"suspicious":%s,"worth_a_look":%s}' \
+        "$FOUND_COUNT" "$SUSPECT_COUNT" "$NOTE_COUNT"
+    printf ',"findings":[%s]'         "$(join_json "${FINDINGS_JSON[@]:-}")"
+    printf ',"context_files":[%s]'    "$(join_json "${ctx[@]:-}")"
+    printf ',"uninspected_files":[%s]' "$(join_json "${blind[@]:-}")"
+    printf ',"steam_libraries":[%s]'  "$(join_json "${libs[@]:-}")"
+    printf ',"report_file":%s'        "$([ -n "$REPORT_FILE" ] && json_str "$REPORT_FILE" || echo null)"
+    printf ',"caveat":%s}\n'          "$(json_str "$CAVEAT")"
 fi
 
 exit "$EXIT"

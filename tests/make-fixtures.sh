@@ -56,6 +56,24 @@ KNOWN_HASH="$(sha256sum "$WS/7777777777/known.pak" | cut -d' ' -f1)"
 # A perfectly ordinary map, to prove we do not flag everything.
 printf 'a completely normal community map\n' > "$WS/1111111111/clean.pak"
 
+# A partial download Steam has staged but not finished installing. The files
+# are on disk all the same, so they must be checked like an installed map.
+DL="$DIRTY/steamroot/steamapps/workshop/downloads/$APPID/5555555555"
+mkdir -p "$DL"
+{ printf 'PARTIAL\x00'; printf '%s' "$MARK_IP"; printf '\x00'; } > "$DL/partial.pak"
+
+# A map copied by hand into the game's own mod folder, outside Steam. There is
+# no Workshop ID; the install folder is resolved from Steam's app manifest.
+printf '"AppState"\n{\n\t"appid"\t\t"%s"\n\t"installdir"\t\t"Test Game"\n}\n' "$APPID" \
+    > "$DIRTY/steamroot/steamapps/appmanifest_$APPID.acf"
+MODS="$DIRTY/steamroot/steamapps/common/Test Game/TestProject/Content/Paks/~mods"
+mkdir -p "$MODS"
+{ printf 'LOOSE\x00'; printf '%s' "$MARK_IP" | iconv -f ASCII -t UTF-16LE; } > "$MODS/loose.pak"
+
+# A filename carrying the characters JSON must escape. It appears in --json
+# output, so a missed escape makes the whole result unparseable.
+{ printf 'ODD\x00'; printf '%s' "$MARK_IP"; } > "$MODS/odd \"quoted\" back\\slash.pak"
+
 # The dropped file, in the Proton prefix where it actually lands (check 5).
 cat > "$PFX/Documents/s.bat" <<'EOF'
 @echo off
@@ -90,6 +108,32 @@ mkdir -p "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222"
 mkdir -p "$CLEAN/home/Documents" "$CLEAN/home/.config/autostart"
 printf 'a completely normal community map\n' \
     > "$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222/nice.pak"
+
+# Unreal containers whose contents a byte search cannot see. Headers follow the
+# real UE5 layouts (checked against shipping games): the scan must SAY it could
+# not look inside these, rather than count them as examined and clean.
+CW="$CLEAN/steamroot/steamapps/workshop/content/$APPID/2222222222"
+le32() { printf "\\x$(printf %02x $(( $1 & 255 )))\\x$(printf %02x $(( ($1 >> 8) & 255 )))\\x$(printf %02x $(( ($1 >> 16) & 255 )))\\x$(printf %02x $(( ($1 >> 24) & 255 )))"; }
+zeros() { head -c "$1" /dev/zero; }
+name32() { printf '%s' "$1"; zeros $(( 32 - ${#1} )); }
+utoc() {  # utoc <flags> <method name or empty>
+    local nmeth=0; [ -n "$2" ] && nmeth=1
+    printf -- '-==--==--==--==-'; printf '\x08'; zeros 3           # magic, version 8
+    le32 144; le32 1; le32 1; le32 12; le32 "$nmeth"; le32 32      # header size .. name length
+    le32 65536; le32 0; le32 1; zeros 8; zeros 16                  # block size .. key GUID
+    printf "\\x$(printf %02x "$1")"; zeros 3; le32 0; zeros 8      # flags, hash seeds, partition size
+    le32 0; zeros 4; zeros 40                                      # to 144 bytes
+    zeros 22; zeros 12                                             # one chunk ID + offset, one block
+    [ -n "$2" ] && name32 "$2"
+}
+utoc 9 "Oodle"  > "$CW/oodle.utoc";  printf 'opaque compressed bytes' > "$CW/oodle.ucas"
+utoc 10 ""      > "$CW/locked.utoc"
+utoc 8 ""       > "$CW/plain.utoc"
+{   # A legacy .pak ending in a version 11 footer that lists Zlib.
+    printf 'opaque compressed bytes'
+    zeros 16; printf '\x00'; printf '\xe1\x12\x6f\x5a'; le32 11
+    zeros 8; zeros 8; zeros 20; name32 "Zlib"; zeros 128
+} > "$CW/zlib.pak"
 
 # ------------------------------------------------------------- variant tree
 #
@@ -136,6 +180,12 @@ has "matches a known malicious file exactly" \
     && ok "check 3  file hash match"              || bad "check 3  file hash match"
 has "Map file contains a known malware marker" \
     && ok "check 4  UTF-16 marker inside .pak"    || bad "check 4  UTF-16 marker inside .pak"
+has "workshop/downloads/$APPID/5555555555/partial.pak" \
+    && ok "check 4  partial download in workshop/downloads" \
+    || bad "check 4  partial download in workshop/downloads"
+has "Content/Paks/~mods/loose.pak" \
+    && ok "check 4  hand-installed map in the game's ~mods folder" \
+    || bad "check 4  hand-installed map in the game's ~mods folder"
 has "where the malware drops its file" \
     && ok "check 5  s.bat in the Proton prefix"   || bad "check 5  s.bat in the Proton prefix"
 has "A script here contains a known malware marker" \
@@ -166,9 +216,23 @@ echo "$OUT_CLEAN" | grep -qF "not proof that you are clean" \
 [ "$RC_CLEAN" -eq 0 ] \
     && ok "exit code 0 when nothing found"        || bad "exit code 0 when nothing found (got $RC_CLEAN)"
 
-JSON_CLEAN="$(bash "$SCANNER" --scan-root "$CLEAN" --indicators "$REPO/indicators.json" --no-color --json 2>/dev/null)"
-printf '%s' "$JSON_CLEAN" | "$PYTHON" -c 'import json,sys; d=json.load(sys.stdin); assert d["result"] == "clean"; assert d["exit_code"] == 0; assert isinstance(d["findings"], list)' \
-    && ok "--json emits a parseable clean result" || bad "--json emits a parseable clean result"
+# Containers the byte search cannot see into are named, with the reason, and
+# do not change the verdict -- compression is normal, not a warning sign.
+echo "$OUT_CLEAN" | grep -qF "Could not look inside 4 map file(s)" \
+    && ok "reports how many map files could not be looked inside" \
+    || bad "reports how many map files could not be looked inside"
+echo "$OUT_CLEAN" | grep -qF "oodle.ucas (compressed with Oodle)" \
+    && ok "reads the compression method from a .utoc, for its .ucas" \
+    || bad "reads the compression method from a .utoc, for its .ucas"
+echo "$OUT_CLEAN" | grep -qF "locked.utoc (encrypted)" \
+    && ok "recognises an encrypted IoStore container" \
+    || bad "recognises an encrypted IoStore container"
+echo "$OUT_CLEAN" | grep -qF "zlib.pak (compressed with Zlib)" \
+    && ok "reads the compression method from a legacy .pak footer" \
+    || bad "reads the compression method from a legacy .pak footer"
+echo "$OUT_CLEAN" | grep -qE "plain\.utoc|nice\.pak" \
+    && bad "does not list containers whose bytes are searchable" \
+    || ok "does not list containers whose bytes are searchable"
 
 # --------------------------------------------- refuses to run without IOCs
 
@@ -181,9 +245,59 @@ bash "$SCANNER" --scan-root "$CLEAN" --indicators "$FIX/bad.json" --no-color >/d
     && ok "exits 2 rather than reporting a false 'clean'" \
     || bad "exits 2 rather than reporting a false 'clean'"
 
-JSON_ERROR="$(bash "$SCANNER" --scan-root "$CLEAN" --indicators "$FIX/bad.json" --no-color --json 2>/dev/null)"
-printf '%s' "$JSON_ERROR" | "$PYTHON" -c 'import json,sys; d=json.load(sys.stdin); assert d["result"] == "error"; assert d["exit_code"] == 2' \
-    && ok "--json stays parseable on errors" || bad "--json stays parseable on errors"
+# ------------------------------------------------------- --json output
+#
+# Fleet scripts parse this, so the contract is: stdout is exactly one valid
+# JSON document, human text never leaks into it, and a scan that could not
+# run still says so in JSON rather than printing nothing.
+
+echo
+echo "  Machine-readable output (--json)"
+echo "  --------------------------------"
+
+if command -v python3 >/dev/null 2>&1; then
+    # json_field <json> <python expression over d>
+    json_field() { printf '%s' "$1" | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>/dev/null; }
+
+    J_DIRTY="$(bash "$SCANNER" --json --scan-root "$DIRTY" --indicators "$TEST_IOC" 2>"$FIX/json.err")"
+    RC_J=$?
+    [ "$(json_field "$J_DIRTY" 'd["verdict"]')" = "indicators_found" ] \
+        && ok "--json stdout parses, verdict indicators_found" \
+        || bad "--json stdout parses, verdict indicators_found"
+    [ "$(json_field "$J_DIRTY" 'd["counts"]["found"]+d["counts"]["suspicious"]==len(d["findings"])')" = "True" ] \
+        && ok "--json lists one finding per counted indicator" \
+        || bad "--json lists one finding per counted indicator"
+    [ "$(json_field "$J_DIRTY" 'any("\"quoted\" back\\slash" in f["where"] for f in d["findings"])')" = "True" ] \
+        && ok "--json escapes quotes and backslashes in paths" \
+        || bad "--json escapes quotes and backslashes in paths"
+    [ "$RC_J" -eq 1 ] && [ "$(json_field "$J_DIRTY" 'd["exit_code"]')" = "1" ] \
+        && ok "--json exit_code field matches the real exit code" \
+        || bad "--json exit_code field matches the real exit code (rc $RC_J)"
+    printf '%s' "$J_DIRTY" | grep -q 'Please read this carefully' \
+        && bad "--json keeps human text off stdout" || ok "--json keeps human text off stdout"
+    grep -q 'Please read this carefully' "$FIX/json.err" \
+        && ok "--json still shows the human report on stderr" \
+        || bad "--json still shows the human report on stderr"
+
+    J_CLEAN="$(bash "$SCANNER" --json --scan-root "$CLEAN" --indicators "$REPO/indicators.json" 2>/dev/null)"
+    [ "$(json_field "$J_CLEAN" 'd["verdict"]')" = "no_known_indicators" ] \
+        && ok "--json clean verdict is no_known_indicators, never 'clean'" \
+        || bad "--json clean verdict is no_known_indicators, never 'clean'"
+    [ "$(json_field "$J_CLEAN" 'len(d["uninspected_files"])')" = "4" ] \
+        && ok "--json lists files that could not be looked inside" \
+        || bad "--json lists files that could not be looked inside"
+    json_field "$J_CLEAN" 'd["caveat"]' | grep -qF "not proof" \
+        && ok "--json carries the 'not proof' caveat" \
+        || bad "--json carries the 'not proof' caveat"
+
+    J_BAD="$(bash "$SCANNER" --json --scan-root "$CLEAN" --indicators "$FIX/bad.json" 2>/dev/null)"
+    RC_JB=$?
+    [ "$RC_JB" -eq 2 ] && [ "$(json_field "$J_BAD" 'd["verdict"]')" = "scan_failed" ] \
+        && ok "--json reports scan_failed with exit 2 when it cannot run" \
+        || bad "--json reports scan_failed with exit 2 when it cannot run (rc $RC_JB)"
+else
+    echo "  (python3 not found -- --json checks skipped; CI runs them)"
+fi
 
 # --------------------------------------- repackaged variant, --deep vs not
 

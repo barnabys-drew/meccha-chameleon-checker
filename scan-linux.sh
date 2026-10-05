@@ -37,6 +37,7 @@ Usage: ./scan-linux.sh [options]
                      checking many computers at once. The normal report
                      still appears, on stderr.
   --no-color         Disable coloured output
+  --json             Emit one machine-readable result on stdout
   -h, --help         Show this help
 
 This tool only reports. It never changes anything on your computer.
@@ -50,6 +51,7 @@ while [ $# -gt 0 ]; do
         --indicators)  INDICATORS="${2:-}"; shift 2 ;;
         --json)        JSON=1; shift ;;
         --no-color)    USE_COLOR=0; shift ;;
+        --json)        JSON=1; USE_COLOR=0; shift ;;
         -h|--help)     usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -282,7 +284,8 @@ container_blind_reason() {  # container_blind_reason <.pak|.utoc|.ucas>
 say ""
 say "${C_BLD}  Meccha Chameleon Workshop malware checker${C_OFF}"
 say "  ${C_DIM}Read-only. This tool changes nothing on your computer.${C_OFF}"
-say "  ${C_DIM}Indicators updated: $(grep -oE '"updated"[^,]*' "$INDICATORS" | grep -oE '[0-9-]{10}')${C_OFF}"
+INDICATORS_UPDATED=$(grep -oE '"updated"[^,]*' "$INDICATORS" | grep -oE '[0-9-]{10}')
+say "  ${C_DIM}Indicators updated: $INDICATORS_UPDATED${C_OFF}"
 say ""
 
 # ------------------------------------------------------- locate steam / homes

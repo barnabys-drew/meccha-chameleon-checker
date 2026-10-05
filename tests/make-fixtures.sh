@@ -16,6 +16,7 @@ REPO="$(dirname "$HERE")"
 FIX="$HERE/fixtures"
 SCANNER="$REPO/scan-linux.sh"
 APPID=4704690
+if python3 --version >/dev/null 2>&1; then PYTHON=python3; else PYTHON=python; fi
 
 PASS=0; FAIL=0
 ok()   { printf '  \033[1;32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1)); }

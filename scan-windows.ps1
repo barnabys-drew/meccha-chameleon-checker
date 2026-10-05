@@ -31,6 +31,20 @@ $script:ReportLines  = New-Object System.Collections.Generic.List[string]
 $script:FoundCount   = 0
 $script:SuspectCount = 0
 $script:NoteCount    = 0
+$script:JsonFindings = New-Object System.Collections.Generic.List[object]
+
+function Write-JsonError {
+    param([string]$Message)
+    if ($JsonOutput) {
+        [pscustomobject]@{
+            tool_version = '1.0.0'; indicators_updated = $null
+            scanned_at = (Get-Date).ToUniversalTime().ToString('o')
+            host = $env:COMPUTERNAME; platform = 'windows'; deep = [bool]$Deep
+            result = 'error'; exit_code = 2; steam_libraries = @(); maps_examined = 0
+            findings = @([pscustomobject]@{ severity = 'note'; check = 'error'; message = $Message; path = $null })
+        } | ConvertTo-Json -Depth 5 -Compress
+    } else { Write-Error $Message }
+}
 
 $script:Findings     = New-Object System.Collections.Generic.List[object]
 
@@ -116,7 +130,10 @@ function Add-Finding {
 # which an innocent file can also do. Kept separate from the Found/Suspect
 # counts so behaviour alone never reads as "you are infected".
 function Add-Note {
-    param([string]$What, [string]$Where)
+    param([string]$What, [string]$Where, [string]$Check = 'behaviour')
+    $script:JsonFindings.Add([pscustomobject]@{
+        severity = 'note'; check = $Check; message = $What; path = $Where
+    })
     $script:NoteCount++
     $script:Findings.Add([pscustomobject]@{ severity = 'WORTH_A_LOOK'; what = $What; location = $Where })
     Say "  [WORTH A LOOK] $What" 'Cyan'
@@ -963,6 +980,19 @@ if ($Json) {
         # result could not be produced" from "this machine was never scanned".
         Stop-Scan "could not build the JSON result: $($_.Exception.Message)"
     }
+}
+
+if ($JsonOutput) {
+    $result = if ($exitCode -eq 1) { 'indicators_found' } elseif ($exitCode -eq 3) { 'behaviour_only' } else { 'clean' }
+    $jsonSteamRoots = @($SteamRoots | ForEach-Object { [string]$_ })
+    $jsonFindings = @($script:JsonFindings | ForEach-Object { $_ })
+    [pscustomobject]@{
+        tool_version = '1.0.0'; indicators_updated = [string]$ioc.updated
+        scanned_at = (Get-Date).ToUniversalTime().ToString('o')
+        host = $env:COMPUTERNAME; platform = 'windows'; deep = [bool]$Deep
+        result = $result; exit_code = $exitCode; steam_libraries = $jsonSteamRoots
+        maps_examined = $mapsSeen; findings = $jsonFindings
+    } | ConvertTo-Json -Depth 5 -Compress
 }
 
 exit $exitCode
